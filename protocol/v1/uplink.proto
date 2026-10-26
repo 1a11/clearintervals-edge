@@ -1,0 +1,115 @@
+syntax = "proto3";
+package clearintervals.uplink.v1;
+option go_package = "github.com/1a11/clearintervals-edge/protocol/v1;uplinkv1";
+
+// Normative bounds and canonical encoding are specified in docs/protocol-v1.md.
+message Frame {
+  uint32 version = 1;
+  oneof body {
+    Hello hello = 10;
+    Welcome welcome = 11;
+    Heartbeat heartbeat = 12;
+    Policy policy = 13;
+    OpenStream open = 14;
+    CreditRequest credit_request = 15;
+    Credit credit = 16;
+    Batch batch = 17;
+    Ack ack = 18;
+    Failure failure = 19;
+    Lifecycle lifecycle = 20;
+    Challenge challenge = 21;
+    Credential credential = 22;
+  }
+}
+message Hello {
+  string gateway_id = 1;
+  uint64 generation = 2;
+  string version = 3;
+  repeated uint32 protocols = 4;
+  repeated string modules = 5;
+  repeated string stream_keys = 6;
+  int64 clock_unix_millis = 7;
+}
+message Welcome {
+  string session_id = 1;
+  uint64 generation = 2;
+  int64 clock_offset_millis = 3;
+  uint32 max_streams = 4;
+  uint32 max_frame_bytes = 5;
+  repeated string unknown_stream_keys = 6;
+  // Sent only when Hello.modules includes flow-control-v1.
+  repeated string capabilities = 7;
+}
+message Heartbeat {
+  uint64 buffer_bytes = 1;
+  uint64 drops = 2;
+  uint64 records = 3;
+  uint64 bytes = 4;
+  uint64 rejected = 5;
+}
+message Policy { string state = 1; }
+message OpenStream {
+  string session_id = 1;
+  uint64 generation = 2;
+  string epoch = 3;
+  string kind = 4;
+}
+message CreditRequest { string session_id = 1; string epoch = 2; uint64 last_grant = 3; string request_id = 4; }
+message Credit {
+  string session_id = 1;
+  string epoch = 2;
+  uint64 grant = 3;
+  uint64 bytes = 4;
+  uint64 items = 5;
+  uint32 retry_after_seconds = 6;
+  string request_id = 7;
+}
+message Capture {
+  bytes metadata_json = 1;
+  uint32 count = 2;
+  bytes samples_le_f32 = 3;
+}
+message Point { string timestamp = 1; double value = 2; }
+message Event { string timestamp = 1; string kind = 2; uint64 count = 3; }
+message Item {
+  uint32 index = 1;
+  string id = 2;
+  bytes hash = 3;
+  string stream_key = 4;
+  string binding_id = 5;
+  // Canonical device identity from product configuration; checked against registry.
+  string source_id = 6;
+  oneof body { Capture capture = 10; Point point = 11; Event event = 12; }
+}
+message Batch { string session_id = 1; string epoch = 2; uint64 sequence = 3; repeated Item items = 4; }
+enum Outcome { OUTCOME_UNSPECIFIED = 0; ACCEPTED = 1; DUPLICATE = 2; REJECTED_PERMANENT = 3; RETRY_LATER = 4; }
+message Result { uint32 index = 1; string id = 2; bytes hash = 3; Outcome outcome = 4; string code = 5; uint32 retry_after_seconds = 6; }
+message Ack { string session_id = 1; string epoch = 2; uint64 sequence = 3; uint64 terminal_frontier = 4; repeated Result results = 5; Credit credit = 6; }
+message Failure { string code = 1; uint32 retry_after_seconds = 2; }
+message Lifecycle {
+  string gateway_id = 1;
+  string operation_id = 2;
+  uint64 generation = 3;
+  string csr_pem = 4;
+  string token = 5;
+  string purpose = 6;
+  bytes csr_hash = 7;
+  string challenge = 8;
+  bytes signature_der = 9;
+  string old_certificate_pem = 10;
+}
+message Challenge {
+  string challenge = 1;
+  string expires_at = 2;
+  // Exact bytes signed with ECDSA P-256/SHA-256. Normative core proof v1.
+  bytes signing_payload = 3;
+}
+message Credential { string operation_id = 1; uint64 generation = 2; string certificate_pem = 3; string issuer_pem = 4; string expires_at = 5; }
+
+// Canonical item hash input. No transport, credential or gateway-specific key.
+message Record {
+  string domain = 1;
+  string source_id = 2;
+  string acquisition_id = 3;
+  oneof body { Capture capture = 10; Point point = 11; Event event = 12; }
+}

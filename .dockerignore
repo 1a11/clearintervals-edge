@@ -1,0 +1,15 @@
+.git
+.github
+bin
+build
+integration
+coverage.out
+*.key
+*.pem
+.env*
+config.yaml
+state
+license*.json
+*.crt
+*.p12
+*.pfx

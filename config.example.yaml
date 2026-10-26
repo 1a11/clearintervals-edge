@@ -1,0 +1,27 @@
+# Disabled until customer credentials, TLS material and immutable product bindings are installed.
+stateDir: /var/lib/edgegateway
+deploymentLicensePath: /var/lib/edgegateway/enrollment/license.json
+statusListen: 127.0.0.1:9081
+buffer:
+  maxBytes: 10737418240
+  maxAgeDays: 7
+  maxSegments: 100000
+modules:
+  remoteWrite:
+    enabled: false
+    listen: 127.0.0.1:8429
+    certificate: ""
+    key: ""
+    writerCa: ""
+    principals: []
+  captures:
+    enabled: false
+    listen: 127.0.0.1:8430
+    certificate: ""
+    key: ""
+    writerCa: ""
+    principals: []
+uplink:
+  forceTcp: false
+  proxy: ""
+bindings: []

@@ -1,0 +1,15 @@
+/bin/
+/build/
+/coverage.out
+*.key
+*.pem
+.env
+__pycache__/
+*_pb2.py
+# Local deployment material: never commit it.
+/config.yaml
+/state/
+license*.json
+*.crt
+*.p12
+*.pfx
