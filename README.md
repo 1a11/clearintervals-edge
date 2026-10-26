@@ -10,6 +10,36 @@ The gateway runs on your network. It receives machine data and sends it to Clear
 - NTP on the host. Captures are refused if the clock is more than 30 s off.
 - An enrollment licence for this gateway, downloaded from the product, and a stream key for each sensor you bind.
 
+## Get your license and stream key
+
+An organization admin sets these up in the Clear Intervals app. The app uses the spelling **licence** on its buttons.
+
+### License: connects one gateway to your account
+
+The license is a JSON file that lets this gateway register with Clear Intervals. It contains a one-time enrollment token and the connection details. Use it before the expiry time shown in the app. After registration, the gateway renews its own certificate.
+
+In the app, open **Gateways** and select **New gateway**. Enter its name and sites, then select **Create and get licence**. In **Save the licence**, select **Download**. The file is named `gateway-<id>.licence.json`.
+
+Copy that file to the gateway host. In the Docker setup below, rename it to `license.json` and put it at `/srv/edgegateway/state/enrollment/license.json`. Docker makes it available inside the container at `/var/lib/edgegateway/enrollment/license.json`, the path in `deploymentLicensePath`. Keep the JSON file unchanged. The gateway deletes it after successful registration.
+
+If you lose the file or it expires before use, open the gateway’s **Credentials** panel and select **Download licence** to issue a new one. For an already enrolled gateway, the action is **Replace…**; read the confirmation before replacing its credentials.
+
+### Stream key: allows data into one configured stream
+
+A stream connects a channel on your gateway to a sensor or machine in Clear Intervals. Its stream key is the secret that authorizes data for that stream. Each stream has its own key.
+
+Open **Gateways**, select your gateway, then select **Add stream**. Choose **Vibration captures** or **Context readings**, select the sensor or machine, complete the stream settings, and select **Add stream**. In **Save the stream key**, select **Download**. The file is named `stream-<id>.key.json`.
+
+Open that file and copy its `streamKey` value into the matching `bindings` entry’s `streamKey` field in `/srv/edgegateway/config/config.yaml`. Copy the value itself, without the surrounding JSON. The stream key is separate from the writer token you create in step 2 below: that token lets Prometheus or vmagent write to your local gateway.
+
+Save the downloaded file safely; the key is shown only when it is created. If it is lost, find the stream in **Credentials** and select **New key…**. Update the gateway configuration with the replacement.
+
+### Billing
+
+Edge gateways require the **Gateway add-on** on your organization’s plan. It is priced per gateway sensor. Vibration capture streams use the gateway sensor allowance; context readings, such as speed or temperature, do not use a sensor slot.
+
+The **Gateways** page shows how many gateway sensors are in use and your plan’s limit. Ask your Clear Intervals account manager to enable the add-on, increase the allowance, or confirm your price and billing terms. The downloaded license is an enrollment credential; your commercial allowance is managed through the plan.
+
 ## Get started
 
 These steps use Docker and the remote-write module. Paths on the host are examples.
@@ -31,13 +61,12 @@ IMAGE=ghcr.io/1a11/clearintervals-edge:sha-<commit from the release>
 
 ```sh
 sudo mkdir -p /srv/edgegateway/config /srv/edgegateway/state/enrollment
-sudo cp license.json /srv/edgegateway/state/enrollment/license.json
+sudo cp gateway-REPLACE_WITH_ID.licence.json /srv/edgegateway/state/enrollment/license.json
 sudo chown -R 65532:65532 /srv/edgegateway/state
 sudo chmod 700 /srv/edgegateway/state && sudo chmod 600 /srv/edgegateway/state/enrollment/license.json
 ```
 
-The licence is deleted automatically once enrollment completes, which is why it lives in the writable state
-volume.
+Replace `gateway-REPLACE_WITH_ID.licence.json` with the filename downloaded from the app. The licence is deleted automatically once enrollment completes, which is why it lives in the writable state volume.
 
 **2. Create a writer credential.** Each writer gets its own token. The gateway stores only the token's SHA-256.
 
@@ -66,7 +95,7 @@ modules:
         tokenSha256: <output of step 2>
 bindings:
   - id: <binding version from the product>
-    streamKey: <stream key from the product>
+    streamKey: <streamKey value from stream-ID.key.json>
     sourceId: <canonical source ID from the product>
     kind: series
     selector:
