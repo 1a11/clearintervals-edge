@@ -2036,7 +2036,7 @@ const file_protocol_v1_uplink_proto_rawDesc = "" +
 	"\bACCEPTED\x10\x01\x12\r\n" +
 	"\tDUPLICATE\x10\x02\x12\x16\n" +
 	"\x12REJECTED_PERMANENT\x10\x03\x12\x0f\n" +
-	"\vRETRY_LATER\x10\x04BAZ?github.com/1a11/clearintervals-edge/protocol/v1;uplinkv1b\x06proto3"
+	"\vRETRY_LATER\x10\x04B:Z8github.com/1a11/clearintervals-edge/protocol/v1;uplinkv1b\x06proto3"
 
 var (
 	file_protocol_v1_uplink_proto_rawDescOnce sync.Once
