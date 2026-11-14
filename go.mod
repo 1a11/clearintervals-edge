@@ -1,6 +1,6 @@
 module github.com/1a11/clearintervals-edge
 
-go 1.27.3
+go 1.27.4
 
 require (
 	github.com/golang/snappy v1.0.0
