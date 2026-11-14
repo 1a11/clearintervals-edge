@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -27,6 +28,41 @@ func TestLogLinesAreJSONWithAnEventKey(t *testing.T) {
 	}
 }
 
+func TestRefusalLogsCodeReasonRefAndSupportHint(t *testing.T) {
+	var out bytes.Buffer
+	newLogger(&out).Warn("uplink_retry", retryAttrs(&uplink.Failure{Code: "invalid_token", Retry: 5 * time.Second, Reason: "enrollment token already used", Ref: "diag-7f3a"}, 5*time.Second)...)
+	var line map[string]any
+	if e := json.Unmarshal(out.Bytes(), &line); e != nil {
+		t.Fatal(e)
+	}
+	if line["reason"] != "server_refusal" || line["code"] != "invalid_token" || line["serverReason"] != "enrollment token already used" || line["ref"] != "diag-7f3a" {
+		t.Fatalf("refusal detail lost: %s", out.String())
+	}
+	if hint, _ := line["hint"].(string); !strings.Contains(hint, "ref") {
+		t.Fatalf("support hint missing: %s", out.String())
+	}
+}
+
+func TestUnknownRefusalCodeIsLoggedVerbatim(t *testing.T) {
+	var out bytes.Buffer
+	newLogger(&out).Warn("uplink_retry", retryAttrs(&uplink.Failure{Code: "new_cloud_code", Retry: time.Second}, time.Second)...)
+	var line map[string]any
+	if e := json.Unmarshal(out.Bytes(), &line); e != nil {
+		t.Fatal(e)
+	}
+	if line["code"] != "new_cloud_code" || line["reason"] != "server_refusal" {
+		t.Fatalf("unknown code collapsed: %s", out.String())
+	}
+}
+
+func TestPreciseRefusalCodesHaveHints(t *testing.T) {
+	for _, code := range []string{"gateway_not_pending", "enrollment_token_missing", "enrollment_token_expired", "enrollment_token_mismatch", "gateway_not_active", "credential_fingerprint_mismatch", "credential_key_reuse", "operation_mismatch", "operation_stale", "gateway_not_found"} {
+		if refusalHints[code] == "" {
+			t.Fatalf("no hint for refusal code %s", code)
+		}
+	}
+}
+
 func TestStopReasonsAreSpecific(t *testing.T) {
 	attrs := stopAttrs(fmt.Errorf("loading: %w", &config.Problem{Field: "stateDir", Reason: "is required"}))
 	if attrs[1] != "configuration_invalid" || attrs[3] != "stateDir" {
@@ -37,6 +73,9 @@ func TestStopReasonsAreSpecific(t *testing.T) {
 	}
 	if attrs := stopAttrs(errors.New("boom")); attrs[1] != "internal" {
 		t.Fatalf("fallback reason: %v", attrs)
+	}
+	if attrs := stopAttrs(&clockSkewError{offset: 95}); attrs[1] != "clock_skew" || attrs[3] != 95.0 {
+		t.Fatalf("clock skew not named: %v", attrs)
 	}
 }
 

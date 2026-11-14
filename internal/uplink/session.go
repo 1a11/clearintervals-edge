@@ -40,11 +40,11 @@ func acceptCredit(c *pb.Credit, sid, epoch, request string, previous *pb.Credit)
 	}
 	return nil
 }
-func (c *Connection) Run(ctx context.Context, q *buffer.Queue, gid string, generation uint64, keys []string, renewAt time.Time) error {
-	return c.run(ctx, q, gid, generation, keys, renewAt, time.Minute)
+func (c *Connection) Run(ctx context.Context, q *buffer.Queue, gid string, generation uint64, keys []string, renewAt time.Time, onWelcome func(clockOffsetMillis int64, unknownKeys []string)) error {
+	return c.run(ctx, q, gid, generation, keys, renewAt, time.Minute, onWelcome)
 }
 
-func (c *Connection) run(ctx context.Context, q *buffer.Queue, gid string, generation uint64, keys []string, renewAt time.Time, heartbeatEvery time.Duration) error {
+func (c *Connection) run(ctx context.Context, q *buffer.Queue, gid string, generation uint64, keys []string, renewAt time.Time, heartbeatEvery time.Duration, onWelcome func(clockOffsetMillis int64, unknownKeys []string)) error {
 	control, f, e := c.Open(ctx, "control", &pb.Frame{Body: &pb.Frame_Hello{Hello: &pb.Hello{GatewayId: gid, Generation: generation, Version: "edgegateway-v1", Protocols: []uint32{1}, Modules: []string{"remoteWrite", "captures", "stream-reopen-v1", "flow-control-v1"}, StreamKeys: keys, ClockUnixMillis: time.Now().UnixMilli()}}})
 	if e != nil {
 		return e
@@ -55,6 +55,11 @@ func (c *Connection) run(ctx context.Context, q *buffer.Queue, gid string, gener
 		return wire.ErrFrame
 	}
 	c.Established = true
+	if onWelcome != nil {
+		// The cloud reports its clock and the keys it does not know; neither is
+		// fatal to the session, so the caller decides how loudly to surface them.
+		onWelcome(welcome.ClockOffsetMillis, welcome.UnknownStreamKeys)
+	}
 	sid := welcome.SessionId
 	streams := map[string]*Stream{}
 	openAfter := map[string]time.Time{}

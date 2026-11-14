@@ -42,6 +42,7 @@ const ownershipHint = "The container runs as UID/GID 65532: make the state volum
 func stopAttrs(e error) []any {
 	var cfg *config.Problem
 	var id *identity.Problem
+	var skew *clockSkewError
 	var path *fs.PathError
 	var op *net.OpError
 	switch {
@@ -49,6 +50,8 @@ func stopAttrs(e error) []any {
 		return []any{"reason", "configuration_invalid", "field", cfg.Field, "problem", cfg.Reason, "hint", "Fix the field and validate with: edgegateway -config <path> -check"}
 	case errors.As(e, &id):
 		return []any{"reason", "identity_invalid", "problem", id.Reason}
+	case errors.As(e, &skew):
+		return []any{"reason", "clock_skew", "offsetSeconds", roundOffset(skew.offset), "hint", "The host clock differs from the cloud by more than 60 seconds, so enrollment cannot proceed. Enable NTP (chrony or systemd-timesyncd) on the host, wait for the clock to settle, then restart the gateway."}
 	case errors.Is(e, errRevoked):
 		return []any{"reason", "revoked", "hint", "This gateway was revoked in the product. It will not send again; the local buffer is kept. Ask your Clear Intervals administrator for a new licence."}
 	case errors.Is(e, durable.ErrLocked):
@@ -73,20 +76,30 @@ func bounded(s string) string {
 }
 
 var refusalHints = map[string]string{
-	"revoked":                "This gateway was revoked in the product.",
-	"organization_suspended": "The organization is suspended. New input is dropped and counted; earlier backlog is kept until it is active again.",
-	"entitlement_inactive":   "The edge gateway add-on is not active for this organization. Data stays buffered.",
-	"clock_skew":             "The host clock differs from the cloud. Run NTP on the host.",
-	"update_required":        "The cloud no longer accepts this release. Deploy a newer verified image.",
-	"duplicate_session":      "Another process is connected with this gateway identity. A copied state volume shares one identity.",
-	"invalid_token":          "The enrollment licence was refused. Download a new licence from the product.",
-	"enrollment_expired":     "The enrollment licence expired. Download a new licence from the product.",
-	"invalid_enrollment":     "The enrollment licence was refused. Download a new licence from the product.",
-	"invalid_credential":     "The cloud did not accept this gateway's certificate. If it persists, re-license the gateway.",
-	"binding_revoked":        "A configured binding was revoked in the product. Remove it from bindings.",
-	"rate_limited":           "The cloud is at capacity. The gateway retries at the time the cloud asked for.",
-	"core_unavailable":       "The cloud is temporarily unavailable. Data stays buffered.",
-	"server_draining":        "The cloud server is restarting. Data stays buffered.",
+	"revoked":                         "This gateway was revoked in the product.",
+	"organization_suspended":          "The organization is suspended. New input is dropped and counted; earlier backlog is kept until it is active again.",
+	"entitlement_inactive":            "The edge gateway add-on is not active for this organization. Data stays buffered.",
+	"clock_skew":                      "The host clock differs from the cloud. Run NTP on the host.",
+	"update_required":                 "The cloud no longer accepts this release. Deploy a newer verified image.",
+	"duplicate_session":               "Another process is connected with this gateway identity. A copied state volume shares one identity.",
+	"invalid_token":                   "The enrollment licence was refused. Download a new licence from the product.",
+	"enrollment_expired":              "The enrollment licence expired. Download a new licence from the product.",
+	"invalid_enrollment":              "The enrollment licence was refused. Download a new licence from the product.",
+	"invalid_credential":              "The cloud did not accept this gateway's certificate. If it persists, re-license the gateway.",
+	"binding_revoked":                 "A configured binding was revoked in the product. Remove it from bindings.",
+	"rate_limited":                    "The cloud is at capacity. The gateway retries at the time the cloud asked for.",
+	"core_unavailable":                "The cloud is temporarily unavailable. Data stays buffered.",
+	"server_draining":                 "The cloud server is restarting. Data stays buffered.",
+	"gateway_not_pending":             "The gateway is already enrolled or revoked. Use renew/recover, or issue a fresh licence.",
+	"enrollment_token_missing":        "Issue a fresh licence for this gateway and reinstall it.",
+	"enrollment_token_expired":        "The licence has expired. Issue a fresh licence for this gateway and reinstall it.",
+	"enrollment_token_mismatch":       "This licence file does not belong to this gateway or is outdated. Download the current licence for this gateway and reinstall it.",
+	"gateway_not_active":              "Enrollment or recovery is required before renewing.",
+	"credential_fingerprint_mismatch": "The stored credential does not match the server record; recover the gateway.",
+	"credential_key_reuse":            "Generate a fresh key: remove the state directory identity and enroll again.",
+	"operation_mismatch":              "The pending operation changed; the gateway will start a fresh operation automatically.",
+	"operation_stale":                 "The pending operation changed; the gateway will start a fresh operation automatically.",
+	"gateway_not_found":               "Unknown gateway. This licence file belongs to a different deployment.",
 }
 
 var transportHints = map[string]string{
@@ -112,14 +125,28 @@ func retryAttrs(err error, delay time.Duration) []any {
 	var transport *uplink.TransportError
 	if errors.As(err, &failure) {
 		reason = "server_refusal"
-		switch failure.Code {
-		case "revoked", "organization_suspended", "rate_limited", "invalid_session", "core_unavailable", "server_draining", "stale_policy", "invalid_credential", "duplicate_session", "update_required", "clock_skew", "invalid_frame", "invalid_csr", "result_unavailable", "invalid_token", "enrollment_expired",
-			"entitlement_inactive", "invalid_enrollment", "invalid_proof", "operation_cancelled", "operation_conflict", "binding_revoked", "result_proof_required", "stream_closed":
-			reason = failure.Code
+		// The cloud's code is a bounded token it chose, so it is always logged
+		// verbatim: collapsing unknown codes hides the reason for a refusal.
+		attrs = append(attrs, "code", failure.Code)
+		if failure.Reason != "" {
+			attrs = append(attrs, "serverReason", bounded(failure.Reason))
 		}
-		if hint, ok := refusalHints[reason]; ok {
-			attrs = append(attrs, "hint", hint)
+		if failure.Ref != "" {
+			attrs = append(attrs, "ref", bounded(failure.Ref))
 		}
+		hint := refusalHints[failure.Code]
+		if failure.Ref != "" {
+			quote := "Quote the ref field in this line when contacting support."
+			if hint == "" {
+				hint = quote
+			} else {
+				hint += " " + quote
+			}
+		}
+		if hint == "" {
+			hint = "The cloud refused the request. Check the gateway configuration and the cloud audit log."
+		}
+		attrs = append(attrs, "hint", hint)
 	} else if errors.As(err, &transport) {
 		reason = "transport"
 		attrs = append(attrs, "stage", transport.Stage)
@@ -153,7 +180,7 @@ var dropHints = map[string]string{
 
 // monitor turns counter changes into log lines, so operators without a
 // Prometheus scraper still learn about dropped data and integrity alarms.
-func monitor(ctx context.Context, q *buffer.Queue, every, summary time.Duration) {
+func monitor(ctx context.Context, q *buffer.Queue, every, summary time.Duration, d *diagnostics) {
 	last, _, _ := q.Snapshot()
 	tick := time.NewTicker(every)
 	defer tick.Stop()
@@ -183,6 +210,15 @@ func monitor(ctx context.Context, q *buffer.Queue, every, summary time.Duration)
 		if time.Since(lastSummary) >= summary {
 			lastSummary = time.Now()
 			logger.Info("buffer_status", "bufferBytes", size, "segments", segments, "acceptedTotal", now.Accepted, "rejectedTotal", now.Rejected)
+			// Keep unresolved findings in front of an operator who missed the
+			// first line, without repeating them on every tick.
+			for _, v := range d.rejectedBindings() {
+				if v.Reason == reasonDigestMismatch {
+					logger.Warn("stream_key_digest_mismatch", "bindingId", v.ID, "kind", v.Kind, "sourceId", v.SourceID, "hint", digestHint)
+				} else {
+					logger.Warn("stream_keys_rejected", "bindingId", v.ID, "kind", v.Kind, "sourceId", v.SourceID, "hint", streamKeyHint)
+				}
+			}
 		}
 		last = now
 	}
