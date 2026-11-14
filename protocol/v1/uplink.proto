@@ -85,7 +85,12 @@ message Batch { string session_id = 1; string epoch = 2; uint64 sequence = 3; re
 enum Outcome { OUTCOME_UNSPECIFIED = 0; ACCEPTED = 1; DUPLICATE = 2; REJECTED_PERMANENT = 3; RETRY_LATER = 4; }
 message Result { uint32 index = 1; string id = 2; bytes hash = 3; Outcome outcome = 4; string code = 5; uint32 retry_after_seconds = 6; }
 message Ack { string session_id = 1; string epoch = 2; uint64 sequence = 3; uint64 terminal_frontier = 4; repeated Result results = 5; Credit credit = 6; }
-message Failure { string code = 1; uint32 retry_after_seconds = 2; }
+message Failure {
+  string code = 1;
+  uint32 retry_after_seconds = 2;
+  string reason = 3; // human-readable refusal reason, safe to show to the operator
+  string ref = 4; // server-side diagnostic reference id; quote to support
+}
 message Lifecycle {
   string gateway_id = 1;
   string operation_id = 2;
@@ -97,6 +102,7 @@ message Lifecycle {
   string challenge = 8;
   bytes signature_der = 9;
   string old_certificate_pem = 10;
+  int64 clock_unix_millis = 11; // sender clock at request time; server compares and reports skew
 }
 message Challenge {
   string challenge = 1;

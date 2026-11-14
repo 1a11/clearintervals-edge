@@ -68,9 +68,13 @@ func tlsStage(e error) string {
 	return "tls_handshake_failed"
 }
 
+// Failure is a cloud refusal. Reason and Ref are server-supplied diagnostics:
+// Reason is human-readable and Ref is the reference id to quote to support.
 type Failure struct {
-	Code  string
-	Retry time.Duration
+	Code   string
+	Retry  time.Duration
+	Reason string
+	Ref    string
 }
 
 func (f *Failure) Error() string { return f.Code }
@@ -206,7 +210,7 @@ func (c *Connection) Unary(ctx context.Context, path string, v *pb.Lifecycle) (*
 func checked(f *pb.Frame) (*pb.Frame, error) {
 	if f.GetFailure() != nil {
 		v := f.GetFailure()
-		return nil, &Failure{v.Code, time.Duration(min(v.RetryAfterSeconds, 900)) * time.Second}
+		return nil, &Failure{Code: v.Code, Retry: time.Duration(min(v.RetryAfterSeconds, 900)) * time.Second, Reason: v.Reason, Ref: v.Ref}
 	}
 	return f, nil
 }

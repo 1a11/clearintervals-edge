@@ -21,6 +21,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 )
@@ -44,7 +45,28 @@ type License struct {
 	Token         string   `json:"enrollmentToken,omitempty"`
 	ExpiresAt     string   `json:"expiresAt,omitempty"`
 	Generation    uint64   `json:"credentialGeneration"`
+	// StreamBindings is the optional roster of bindings this licence authorizes.
+	// Older licences omit it, which skips the check entirely.
+	StreamBindings []StreamBinding `json:"streamBindings,omitempty"`
 }
+
+// StreamBinding is one entry of the licence roster. KeyDigest is the hex
+// SHA-256 of the binding's stream key.
+type StreamBinding struct {
+	ID        string `json:"id"`
+	Kind      string `json:"kind"`
+	DeviceID  string `json:"deviceId"`
+	SensorID  string `json:"sensorId"`
+	AssetID   string `json:"assetId"`
+	KeyDigest string `json:"keyDigest"`
+}
+
+// Binding is the configured binding subset the licence roster authorizes.
+type Binding struct{ ID, Kind, SourceID, StreamKey string }
+
+// RosterMismatch names a configured binding whose stream key no longer matches
+// the licence roster. It is not fatal: the key may lag a rotation.
+type RosterMismatch struct{ BindingID, Kind, SourceID string }
 type Pending struct {
 	Operation, Kind, Key, CSR, Hash string
 	Generation                      uint64
@@ -204,6 +226,9 @@ func (m *Manager) Prepare(now time.Time) error {
 	generation := m.Trust.Generation
 	token := m.Trust.Token
 	if m.Active != nil {
+		if e := m.adoptLicense(); e != nil {
+			return e
+		}
 		generation = m.Active.Generation
 		kind = "renew"
 		cert, e := m.Certificate()
@@ -264,6 +289,63 @@ func (m *Manager) Prepare(now time.Time) error {
 	m.Pending = p
 	return nil
 }
+
+// adoptLicense refreshes the stored roster from a licence dropped at the
+// configured path while a credential is active. Rotation never changes the
+// stream keys, so only the roster is adopted and trust.json is rewritten only
+// when the roster actually differs.
+func (m *Manager) adoptLicense() error {
+	var l License
+	e := limitedJSON(m.LicensePath, &l)
+	if errors.Is(e, os.ErrNotExist) {
+		return nil
+	}
+	if e != nil {
+		return problem("the licence at " + m.LicensePath + " cannot be read or is not the JSON file downloaded from the product")
+	}
+	if l.FormatVersion != 1 {
+		return problem("the licence at " + m.LicensePath + " has an unsupported formatVersion; this release reads format 1")
+	}
+	if l.GatewayID != m.Trust.GatewayID || l.Region != m.Trust.Region || l.IngestURL != m.Trust.IngestURL {
+		return problem("the licence at " + m.LicensePath + " belongs to a different gateway than identity/trust.json; use that gateway's licence or a fresh state directory")
+	}
+	if len(l.StreamBindings) == 0 || slices.Equal(l.StreamBindings, m.Trust.StreamBindings) {
+		return nil
+	}
+	m.Trust.StreamBindings = l.StreamBindings
+	trust := m.Trust
+	trust.Token = ""
+	raw, _ := json.Marshal(trust)
+	return durable.Write(filepath.Join(m.Dir, "trust.json"), raw)
+}
+
+// CheckBindings compares configured bindings with the licence roster. A licence
+// without a roster skips the check. A binding missing from the roster is fatal:
+// the licence belongs to a different gateway or the binding is not authorized.
+// A digest mismatch is returned for the caller to surface without stopping.
+func (m *Manager) CheckBindings(bindings []Binding) ([]RosterMismatch, error) {
+	roster := m.Trust.StreamBindings
+	if len(roster) == 0 {
+		return nil, nil
+	}
+	authorized := make(map[string]StreamBinding, len(roster))
+	for _, v := range roster {
+		authorized[v.ID] = v
+	}
+	var mismatches []RosterMismatch
+	for _, b := range bindings {
+		entry, ok := authorized[b.ID]
+		if !ok {
+			return nil, problem("configured binding " + b.ID + " is not in the streamBindings roster of the licence for gateway " + m.Trust.GatewayID + "; the licence belongs to a different gateway or this binding is not authorized")
+		}
+		digest := sha256.Sum256([]byte(b.StreamKey))
+		if !strings.EqualFold(hex.EncodeToString(digest[:]), entry.KeyDigest) {
+			mismatches = append(mismatches, RosterMismatch{BindingID: b.ID, Kind: b.Kind, SourceID: b.SourceID})
+		}
+	}
+	return mismatches, nil
+}
+
 func (m *Manager) TLS(now time.Time) *tls.Config {
 	c := &tls.Config{RootCAs: m.Roots, MinVersion: tls.VersionTLS13, SessionTicketsDisabled: true}
 	if m.Active != nil {
@@ -375,7 +457,7 @@ func (m *Manager) Issue(ctx context.Context, c *uplink.Connection) error {
 	var challenge string
 	var sig []byte
 	var e error
-	request := &pb.Lifecycle{GatewayId: m.Trust.GatewayID, OperationId: p.Operation, Generation: p.Generation, CsrPem: p.CSR, Token: p.Token}
+	request := &pb.Lifecycle{GatewayId: m.Trust.GatewayID, OperationId: p.Operation, Generation: p.Generation, CsrPem: p.CSR, Token: p.Token, ClockUnixMillis: time.Now().UnixMilli()}
 	if p.Kind == "recover" {
 		challenge, sig, e = m.proof(ctx, c, "recover")
 		if e != nil {

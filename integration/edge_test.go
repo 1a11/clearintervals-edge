@@ -140,7 +140,9 @@ func drain(t *testing.T, m *identity.Manager, q *buffer.Queue, h3 bool, capacity
 	c := dial(t, m, false, h3)
 	defer c.Close()
 	done := make(chan error, 1)
-	go func() { done <- c.Run(ctx, q, m.Trust.GatewayID, m.Active.Generation, nil, time.Now().Add(time.Hour)) }()
+	go func() {
+		done <- c.Run(ctx, q, m.Trust.GatewayID, m.Active.Generation, nil, time.Now().Add(time.Hour), nil)
+	}()
 	if capacityRelease != nil {
 		time.AfterFunc(6*time.Second, capacityRelease)
 	}
@@ -240,7 +242,7 @@ func TestRealCoreLostIssuanceReplyRedundancyZeroCreditAndQUIC(t *testing.T) {
 	admin(t, f, "/revoke", map[string]any{"name": "primary"})
 	if conn, e := uplink.Dial(context.Background(), m.Trust.IngestURL, "", m.TLS(time.Now()), true); e == nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		e = conn.Run(ctx, q, m.Trust.GatewayID, m.Active.Generation, nil, time.Now().Add(time.Hour))
+		e = conn.Run(ctx, q, m.Trust.GatewayID, m.Active.Generation, nil, time.Now().Add(time.Hour), nil)
 		cancel()
 		conn.Close()
 		if e == nil {

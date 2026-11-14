@@ -145,7 +145,7 @@ func TestZeroCreditPollResumesAndRetainsUntilMatchedAck(t *testing.T) {
 	}
 	defer conn.Close()
 	done := make(chan error, 1)
-	go func() { done <- conn.run(ctx, q, "gateway", 2, nil, now.Add(time.Hour), 20*time.Millisecond) }()
+	go func() { done <- conn.run(ctx, q, "gateway", 2, nil, now.Add(time.Hour), 20*time.Millisecond, nil) }()
 	select {
 	case <-completed:
 	case <-ctx.Done():

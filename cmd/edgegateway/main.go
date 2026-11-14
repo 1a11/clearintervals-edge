@@ -9,6 +9,7 @@ import (
 	"github.com/1a11/clearintervals-edge/internal/auth"
 	"github.com/1a11/clearintervals-edge/internal/buffer"
 	"github.com/1a11/clearintervals-edge/internal/captures"
+	"github.com/1a11/clearintervals-edge/internal/clock"
 	"github.com/1a11/clearintervals-edge/internal/config"
 	"github.com/1a11/clearintervals-edge/internal/durable"
 	"github.com/1a11/clearintervals-edge/internal/httpauth"
@@ -17,6 +18,7 @@ import (
 	"github.com/1a11/clearintervals-edge/internal/uplink"
 	"io"
 	"log"
+	"math"
 	"math/rand/v2"
 	"net"
 	"net/http"
@@ -101,6 +103,22 @@ func run(path string, check bool) error {
 		state = "operation_pending"
 	}
 	logger.Info("identity_loaded", "gatewayId", manager.Trust.GatewayID, "region", manager.Trust.Region, "state", state)
+	d := new(diagnostics)
+	if manager.Active == nil {
+		// First start: a clock far from the cloud makes enrollment impossible,
+		// so compare once before any credential operation.
+		probeCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		offset, x := clock.Probe(probeCtx, manager.Trust.IngestURL, manager.Roots)
+		cancel()
+		if x != nil {
+			logger.Warn("clock_probe_failed", "problem", bounded(x.Error()), "hint", "The gateway could not compare its clock with the cloud. Check DNS and outbound HTTPS; enrollment continues.")
+		} else {
+			d.observeClock(offset, "startup")
+			if math.Abs(offset) > clock.StartupThreshold.Seconds() {
+				return &clockSkewError{offset}
+			}
+		}
+	}
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 	store := config.New(c)
@@ -151,6 +169,11 @@ func run(path string, check bool) error {
 			w.WriteHeader(503)
 			return
 		}
+		// Clock drift and rejected stream keys are surfaced, never fatal.
+		if note := d.degraded(); note != "" {
+			fmt.Fprintf(w, "degraded: %s\n", note)
+			return
+		}
 		w.WriteHeader(200)
 	})
 	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
@@ -160,6 +183,8 @@ func run(path string, check bool) error {
 		for _, reason := range []string{"unmapped", "suspended", "too_old", "evicted", "invalid", "too_large"} {
 			fmt.Fprintf(w, "edgegateway_drops_total{reason=%q} %d\n", reason, s.Drops[reason])
 		}
+		offset, alarm, rejected := d.snapshot()
+		fmt.Fprintf(w, "edgegateway_clock_offset_seconds %.3f\nedgegateway_clock_skew_alarm %d\nedgegateway_stream_keys_rejected %d\n", offset, alarm, rejected)
 	})
 	if e = serve("status", c.StatusListen, mux, nil, 80); e != nil {
 		return e
@@ -186,8 +211,9 @@ func run(path string, check bool) error {
 	if !c.Modules.RemoteWrite.Enabled && !c.Modules.Captures.Enabled {
 		logger.Warn("no_modules_enabled", "hint", "No writer can send data. Enable modules.remoteWrite or modules.captures.")
 	}
-	wg.Go(func() { errc <- forward(ctx, store, q, manager) })
-	wg.Go(func() { monitor(ctx, q, time.Minute, 15*time.Minute) })
+	wg.Go(func() { errc <- forward(ctx, store, q, manager, d) })
+	wg.Go(func() { monitor(ctx, q, time.Minute, 15*time.Minute, d) })
+	wg.Go(func() { clockMonitor(ctx, d, manager.Trust.IngestURL, manager.Roots, time.Hour, manager.Active != nil) })
 	logger.Info("gateway_ready", "bindings", len(c.Bindings))
 	for {
 		select {
@@ -199,7 +225,14 @@ func run(path string, check bool) error {
 		case <-hup:
 			next, e := config.Load(path)
 			if e == nil {
-				e = store.Reload(next)
+				// Reject a reload that would leave a binding outside the
+				// licence roster; the previous configuration stays active.
+				mismatches, x := manager.CheckBindings(rosterBindings(next.Bindings))
+				if x != nil {
+					e = x
+				} else if e = store.Reload(next); e == nil {
+					d.observeDigestMismatches(mismatches)
+				}
 			}
 			if e != nil {
 				logger.Error("configuration_rejected", append(stopAttrs(e), "kept", "previous configuration")...)
@@ -215,7 +248,7 @@ func boolInt(v bool) int {
 	}
 	return 0
 }
-func forward(ctx context.Context, store *config.Store, q *buffer.Queue, m *identity.Manager) error {
+func forward(ctx context.Context, store *config.Store, q *buffer.Queue, m *identity.Manager, d *diagnostics) error {
 	backoff := 5 * time.Second
 	capacityBackoff := time.Duration(0)
 	tcpUntil := time.Time{}
@@ -227,6 +260,11 @@ func forward(ctx context.Context, store *config.Store, q *buffer.Queue, m *ident
 		if e := m.Prepare(time.Now()); e != nil {
 			return e
 		}
+		mismatches, x := m.CheckBindings(rosterBindings(c.Bindings))
+		if x != nil {
+			return x
+		}
+		d.observeDigestMismatches(mismatches)
 		var e error
 		if m.Pending != nil {
 			kind := m.Pending.Kind
@@ -256,6 +294,21 @@ func forward(ctx context.Context, store *config.Store, q *buffer.Queue, m *ident
 				}
 				logger.Info("credential_activated", attrs...)
 			}
+			if e != nil {
+				var failure *uplink.Failure
+				if errors.As(e, &failure) {
+					// The retry log follows; this line names the operation the
+					// cloud refused so it can be matched with the cloud audit log.
+					attrs := []any{"operation", kind, "code", failure.Code}
+					if failure.Reason != "" {
+						attrs = append(attrs, "reason", bounded(failure.Reason))
+					}
+					if failure.Ref != "" {
+						attrs = append(attrs, "ref", bounded(failure.Ref))
+					}
+					logger.Info("credential_operation_refused", attrs...)
+				}
+			}
 		} else {
 			conn, x := uplink.Dial(ctx, m.Trust.IngestURL, c.Uplink.Proxy, m.TLS(time.Now()), c.Uplink.ForceTCP || time.Now().Before(tcpUntil))
 			if x == nil {
@@ -277,7 +330,9 @@ func forward(ctx context.Context, store *config.Store, q *buffer.Queue, m *ident
 				if conn.Kind == "h2" && !c.Uplink.ForceTCP && c.Uplink.Proxy == "" && tcpUntil.Before(renewAt) {
 					renewAt = tcpUntil
 				}
-				e = conn.Run(ctx, q, m.Trust.GatewayID, m.Active.Generation, keys, renewAt)
+				e = conn.Run(ctx, q, m.Trust.GatewayID, m.Active.Generation, keys, renewAt, func(offsetMillis int64, unknownKeys []string) {
+					d.observeWelcome(offsetMillis, unknownKeys, c.Bindings)
+				})
 				backoff = sessionBackoff(backoff, conn.Established)
 				if conn.Established {
 					capacityBackoff = 0

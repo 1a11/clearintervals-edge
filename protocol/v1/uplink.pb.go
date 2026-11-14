@@ -1435,6 +1435,8 @@ type Failure struct {
 	state             protoimpl.MessageState `protogen:"open.v1"`
 	Code              string                 `protobuf:"bytes,1,opt,name=code,proto3" json:"code,omitempty"`
 	RetryAfterSeconds uint32                 `protobuf:"varint,2,opt,name=retry_after_seconds,json=retryAfterSeconds,proto3" json:"retry_after_seconds,omitempty"`
+	Reason            string                 `protobuf:"bytes,3,opt,name=reason,proto3" json:"reason,omitempty"` // human-readable refusal reason, safe to show to the operator
+	Ref               string                 `protobuf:"bytes,4,opt,name=ref,proto3" json:"ref,omitempty"`       // server-side diagnostic reference id; quote to support
 	unknownFields     protoimpl.UnknownFields
 	sizeCache         protoimpl.SizeCache
 }
@@ -1483,6 +1485,20 @@ func (x *Failure) GetRetryAfterSeconds() uint32 {
 	return 0
 }
 
+func (x *Failure) GetReason() string {
+	if x != nil {
+		return x.Reason
+	}
+	return ""
+}
+
+func (x *Failure) GetRef() string {
+	if x != nil {
+		return x.Ref
+	}
+	return ""
+}
+
 type Lifecycle struct {
 	state             protoimpl.MessageState `protogen:"open.v1"`
 	GatewayId         string                 `protobuf:"bytes,1,opt,name=gateway_id,json=gatewayId,proto3" json:"gateway_id,omitempty"`
@@ -1495,6 +1511,7 @@ type Lifecycle struct {
 	Challenge         string                 `protobuf:"bytes,8,opt,name=challenge,proto3" json:"challenge,omitempty"`
 	SignatureDer      []byte                 `protobuf:"bytes,9,opt,name=signature_der,json=signatureDer,proto3" json:"signature_der,omitempty"`
 	OldCertificatePem string                 `protobuf:"bytes,10,opt,name=old_certificate_pem,json=oldCertificatePem,proto3" json:"old_certificate_pem,omitempty"`
+	ClockUnixMillis   int64                  `protobuf:"varint,11,opt,name=clock_unix_millis,json=clockUnixMillis,proto3" json:"clock_unix_millis,omitempty"` // sender clock at request time; server compares and reports skew
 	unknownFields     protoimpl.UnknownFields
 	sizeCache         protoimpl.SizeCache
 }
@@ -1597,6 +1614,13 @@ func (x *Lifecycle) GetOldCertificatePem() string {
 		return x.OldCertificatePem
 	}
 	return ""
+}
+
+func (x *Lifecycle) GetClockUnixMillis() int64 {
+	if x != nil {
+		return x.ClockUnixMillis
+	}
+	return 0
 }
 
 type Challenge struct {
@@ -1987,10 +2011,12 @@ const file_protocol_v1_uplink_proto_rawDesc = "" +
 	"\bsequence\x18\x03 \x01(\x04R\bsequence\x12+\n" +
 	"\x11terminal_frontier\x18\x04 \x01(\x04R\x10terminalFrontier\x12:\n" +
 	"\aresults\x18\x05 \x03(\v2 .clearintervals.uplink.v1.ResultR\aresults\x128\n" +
-	"\x06credit\x18\x06 \x01(\v2 .clearintervals.uplink.v1.CreditR\x06credit\"M\n" +
+	"\x06credit\x18\x06 \x01(\v2 .clearintervals.uplink.v1.CreditR\x06credit\"w\n" +
 	"\aFailure\x12\x12\n" +
 	"\x04code\x18\x01 \x01(\tR\x04code\x12.\n" +
-	"\x13retry_after_seconds\x18\x02 \x01(\rR\x11retryAfterSeconds\"\xc4\x02\n" +
+	"\x13retry_after_seconds\x18\x02 \x01(\rR\x11retryAfterSeconds\x12\x16\n" +
+	"\x06reason\x18\x03 \x01(\tR\x06reason\x12\x10\n" +
+	"\x03ref\x18\x04 \x01(\tR\x03ref\"\xf0\x02\n" +
 	"\tLifecycle\x12\x1d\n" +
 	"\n" +
 	"gateway_id\x18\x01 \x01(\tR\tgatewayId\x12!\n" +
@@ -2005,7 +2031,8 @@ const file_protocol_v1_uplink_proto_rawDesc = "" +
 	"\tchallenge\x18\b \x01(\tR\tchallenge\x12#\n" +
 	"\rsignature_der\x18\t \x01(\fR\fsignatureDer\x12.\n" +
 	"\x13old_certificate_pem\x18\n" +
-	" \x01(\tR\x11oldCertificatePem\"q\n" +
+	" \x01(\tR\x11oldCertificatePem\x12*\n" +
+	"\x11clock_unix_millis\x18\v \x01(\x03R\x0fclockUnixMillis\"q\n" +
 	"\tChallenge\x12\x1c\n" +
 	"\tchallenge\x18\x01 \x01(\tR\tchallenge\x12\x1d\n" +
 	"\n" +
