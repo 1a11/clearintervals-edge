@@ -287,6 +287,10 @@ func forward(ctx context.Context, store *config.Store, q *buffer.Queue, m *ident
 					e = x
 				}
 			}
+			if kind == "recover" && m.Pending != nil && m.Pending.Kind != kind {
+				// Issue rewrote the journal because the active credential is gone.
+				logger.Warn("recover_impossible_enrolling", "operation", m.Pending.Kind, "reason", "the stored credential cannot be used for recovery", "hint", "The gateway enrolls again with the licence at its deploymentLicensePath. Buffered data is kept.")
+			}
 			if e == nil && m.Pending == nil {
 				attrs := []any{"operation", kind}
 				if cert, x := m.Certificate(); x == nil {
