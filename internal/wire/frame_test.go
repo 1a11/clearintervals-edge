@@ -36,6 +36,25 @@ func TestBoundsBeforeBodyRead(t *testing.T) {
 	}
 }
 
+// A refusal explains the refusal in its reason, and cloud refusals name the
+// missing operation or stale state in well over 100 bytes. The frame must
+// still parse: the edge acts on the code, and a rejected frame would hide
+// the refusal behind an invalid_response_frame retry loop.
+func TestRefusalFrameWithLongReasonParses(t *testing.T) {
+	long := "No lifecycle operation 'ce96bc67cd4ac65d98b0c9390179d049' exists for gateway 'gw-25976d9d0323664cd6e8c4f002850c26'. Check the operation id the cloud gateway is asking about."
+	var b bytes.Buffer
+	if e := Write(&b, &pb.Frame{Body: &pb.Frame_Failure{Failure: &pb.Failure{Code: "result_unavailable", RetryAfterSeconds: 5, Reason: long, Ref: "0123456789abcdef"}}}); e != nil {
+		t.Fatal(e)
+	}
+	f, _, e := Read(&b, MaxControl, nil)
+	if e != nil {
+		t.Fatalf("refusal frame with a long reason rejected: %v", e)
+	}
+	if f.GetFailure().GetCode() != "result_unavailable" || f.GetFailure().GetReason() != long {
+		t.Fatalf("refusal changed on the wire: %v", f.GetFailure())
+	}
+}
+
 func TestForgedItemCountIsRejectedBeforeProtobufExpansion(t *testing.T) {
 	batch := []byte{}
 	for j := 0; j < 1001; j++ {

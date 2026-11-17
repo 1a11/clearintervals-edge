@@ -156,6 +156,12 @@ func preflight(raw []byte, desc protoreflect.MessageDescriptor, depth int) bool 
 					maximumBytes = 100
 				case "timestamp":
 					maximumBytes = 50
+				case "reason":
+					// Refusals carry an operator-readable explanation that
+					// exceeds 100 bytes (e.g. result_unavailable names the
+					// missing operation); rejecting it would hide the refusal
+					// code behind an unparseable frame.
+					maximumBytes = 1024
 				}
 				if len(payload) > maximumBytes {
 					return false
