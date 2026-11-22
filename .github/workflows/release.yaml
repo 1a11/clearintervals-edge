@@ -20,7 +20,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     permissions:
-      contents: write
+      contents: read
       packages: write
       id-token: write
     env:
@@ -102,19 +102,3 @@ jobs:
             sbom.cdx.json
             signature-verification.json
           if-no-files-found: error
-      - name: Publish public downloads
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          SOURCE_SHA: ${{ inputs.revision || github.sha }}
-          REF: ${{ steps.image.outputs.ref }}
-        run: |
-          target="ghcr.io/${GITHUB_REPOSITORY,,}:sha-$SOURCE_SHA"
-          docker pull "$REF"
-          docker tag "$REF" "$target"
-          docker save "$target" | gzip > edgegateway-image.tar.gz
-          cp bin/edgegateway edgegateway-linux-amd64
-          sha256sum edgegateway-linux-amd64 edgegateway-image.tar.gz image-digest.txt sbom.cdx.json signature-verification.json > SHA256SUMS
-          tag="build-$SOURCE_SHA"
-          printf 'Linux amd64 build from commit `%s`.\n\nDownload the image archive and SHA256SUMS, check the checksum, then load it with docker load. See the README for setup.\n' "$SOURCE_SHA" > release-notes.md
-          gh release create "$tag" --repo "$GITHUB_REPOSITORY" --target "$SOURCE_SHA" --title "Edge gateway $SOURCE_SHA" --notes-file release-notes.md --latest \
-            edgegateway-linux-amd64 edgegateway-image.tar.gz SHA256SUMS image-digest.txt sbom.cdx.json signature-verification.json

@@ -161,9 +161,6 @@ func retryAttrs(err error, delay time.Duration) []any {
 		reason = "transport"
 	} else if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 		reason = "eof"
-	} else if errors.Is(err, identity.ErrIdentity) {
-		reason = "identity"
-		attrs = append(attrs, "hint", "The local identity state cannot be used. Check the gateway log for the identity problem; if it persists, the state directory is damaged.")
 	}
 	return append([]any{"reason", reason, "retryAfterSeconds", delay.Seconds()}, attrs...)
 }
