@@ -136,3 +136,76 @@ func TestProblemsNameTheFieldButNeverTheValue(t *testing.T) {
 		t.Fatalf("YAML error must keep the line and drop the value: %v", e)
 	}
 }
+
+// A gateway enrolled from the fixed download configuration has no bindings of
+// its own. The cloud descriptors become its streams, so the operator never
+// repeats principals or a scale per stream.
+func TestDescriptorsSyncInstallsCloudBindings(t *testing.T) {
+	c := valid(t)
+	store := New(c)
+	if store.DescriptorsSynced() {
+		t.Fatal("bindings reported before any source")
+	}
+	d := Binding{ID: "d1", StreamKey: strings.Repeat("k", 43), SourceID: "source", Kind: "series", Selector: map[string]string{"__name__": "rpm"}}
+	if !store.SyncDescriptors([]Binding{d}) {
+		t.Fatal("first sync did not change the store")
+	}
+	if !store.DescriptorsSynced() {
+		t.Fatal("completed sync not reported")
+	}
+	saved := store.Get().Bindings
+	if len(saved) != 1 || saved[0].ID != "d1" || saved[0].Scale != 1 || len(saved[0].Principals) != 1 || saved[0].Principals[0] != "writer" {
+		t.Fatalf("descriptor not normalized: %+v", saved)
+	}
+	if store.SyncDescriptors([]Binding{d}) {
+		t.Fatal("identical sync rewrote the active snapshot")
+	}
+	// Rotating a principal must not erase the cloud streams.
+	next := *c
+	next.Modules.RemoteWrite.Principals = []Principal{{ID: "writer", TokenSHA256: strings.Repeat("ab", 32)}}
+	if e := store.Reload(&next); e != nil {
+		t.Fatal(e)
+	}
+	if b := store.Get().Bindings; len(b) != 1 || b[0].ID != "d1" {
+		t.Fatalf("reload erased cloud bindings: %+v", b)
+	}
+}
+
+// A binding written in config.yaml outranks the descriptor for the same ID.
+func TestDescriptorSyncKeepsFileBindingsAuthoritative(t *testing.T) {
+	c := valid(t)
+	c.Bindings = []Binding{{ID: "shared", SourceID: "source", Kind: "series", StreamKey: strings.Repeat("f", 43), Selector: map[string]string{"__name__": "file"}, Principals: []string{"writer"}, Scale: 2}}
+	store := New(c)
+	if !store.DescriptorsSynced() {
+		t.Fatal("file bindings not reported")
+	}
+	store.SyncDescriptors([]Binding{
+		{ID: "shared", SourceID: "other", Kind: "series", StreamKey: strings.Repeat("c", 43), Selector: map[string]string{"__name__": "cloud"}, Scale: 1},
+		{ID: "fresh", SourceID: "source", Kind: "series", StreamKey: strings.Repeat("d", 43), Selector: map[string]string{"__name__": "cloud"}},
+	})
+	b := store.Get().Bindings
+	if len(b) != 2 {
+		t.Fatalf("unexpected bindings: %+v", b)
+	}
+	if b[0].ID != "shared" || b[0].Selector["__name__"] != "file" || b[0].Scale != 2 {
+		t.Fatalf("cloud descriptor replaced the file binding: %+v", b[0])
+	}
+	if b[1].ID != "fresh" || b[1].Scale != 1 || len(b[1].Principals) != 1 {
+		t.Fatalf("cloud descriptor not installed: %+v", b[1])
+	}
+}
+
+// An empty answer still completes the wait: the cloud has named no streams, so
+// remote write must stop holding its first batch.
+func TestDescriptorsSyncWithNoDescriptorsCompletesTheWait(t *testing.T) {
+	store := New(valid(t))
+	if store.DescriptorsSynced() {
+		t.Fatal("bindings reported before any source")
+	}
+	if store.SyncDescriptors(nil) {
+		t.Fatal("empty sync changed the snapshot")
+	}
+	if !store.DescriptorsSynced() {
+		t.Fatal("empty sync did not complete the wait")
+	}
+}

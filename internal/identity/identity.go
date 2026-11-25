@@ -243,22 +243,9 @@ func (m *Manager) Prepare(now time.Time) error {
 		}
 	}
 	if kind == "enroll" {
-		var l License
-		if e := limitedJSON(m.LicensePath, &l); e != nil {
-			return problem("enrollment needs the licence at " + m.LicensePath + ", which is missing or unreadable")
-		}
-		if l.GatewayID != m.Trust.GatewayID || l.Region != m.Trust.Region || l.IngestURL != m.Trust.IngestURL {
-			return problem("the licence belongs to a different gateway than identity/trust.json; use a fresh state directory or that gateway's licence")
-		}
-		if l.Generation == 0 || l.Generation > 1<<50 || len(l.Token) < 40 || len(l.Token) > 100 {
-			return problem("the licence has no usable enrollment token; download a new one from the product")
-		}
-		expiry, e := time.Parse(time.RFC3339Nano, l.ExpiresAt)
+		l, e := m.enrollmentLicense(now)
 		if e != nil {
-			return problem("the licence expiresAt is not an RFC 3339 time")
-		}
-		if !now.Before(expiry) {
-			return problem("the enrollment licence expired at " + expiry.UTC().Format(time.RFC3339) + "; download a new one from the product")
+			return e
 		}
 		generation = l.Generation
 		token = l.Token
@@ -290,6 +277,30 @@ func (m *Manager) Prepare(now time.Time) error {
 	return nil
 }
 
+// enrollmentLicense reads the licence needed to enroll and checks it against
+// trust.json. Recovering an expired credential needs it too when the active
+// bundle is gone, so both paths share one rule.
+func (m *Manager) enrollmentLicense(now time.Time) (*License, error) {
+	var l License
+	if e := limitedJSON(m.LicensePath, &l); e != nil {
+		return nil, problem("enrollment needs the licence at " + m.LicensePath + ", which is missing or unreadable")
+	}
+	if l.GatewayID != m.Trust.GatewayID || l.Region != m.Trust.Region || l.IngestURL != m.Trust.IngestURL {
+		return nil, problem("the licence belongs to a different gateway than identity/trust.json; use a fresh state directory or that gateway's licence")
+	}
+	if l.Generation == 0 || l.Generation > 1<<50 || len(l.Token) < 40 || len(l.Token) > 100 {
+		return nil, problem("the licence has no usable enrollment token; download a new one from the product")
+	}
+	expiry, e := time.Parse(time.RFC3339Nano, l.ExpiresAt)
+	if e != nil {
+		return nil, problem("the licence expiresAt is not an RFC 3339 time")
+	}
+	if !now.Before(expiry) {
+		return nil, problem("the enrollment licence expired at " + expiry.UTC().Format(time.RFC3339) + "; download a new one from the product")
+	}
+	return &l, nil
+}
+
 // adoptLicense refreshes the stored roster from a licence dropped at the
 // configured path while a credential is active. Rotation never changes the
 // stream keys, so only the roster is adopted and trust.json is rewritten only
@@ -319,10 +330,14 @@ func (m *Manager) adoptLicense() error {
 	return durable.Write(filepath.Join(m.Dir, "trust.json"), raw)
 }
 
-// CheckBindings compares configured bindings with the licence roster. A licence
-// without a roster skips the check. A binding missing from the roster is fatal:
-// the licence belongs to a different gateway or the binding is not authorized.
-// A digest mismatch is returned for the caller to surface without stopping.
+// CheckBindings compares configured bindings with the licence roster. A
+// licence without a roster (nil slice, pre-roster licences) skips the check
+// entirely. An empty roster skips it too: a gateway enrolled from the fixed
+// download configuration has no bindings at download time, and its stream
+// descriptors arrive from the cloud after enrollment instead of from a licence.
+// A binding missing from a non-empty roster is fatal: the licence belongs to a
+// different gateway or the binding is not authorized. A digest mismatch is
+// returned for the caller to surface without stopping.
 func (m *Manager) CheckBindings(bindings []Binding) ([]RosterMismatch, error) {
 	roster := m.Trust.StreamBindings
 	if len(roster) == 0 {
@@ -410,16 +425,18 @@ func (m *Manager) proof(ctx context.Context, c *uplink.Connection, purpose strin
 		return "", nil, e
 	}
 	if purpose == "recover" {
+		// A recover-pending whose active bundle vanished after the journal was
+		// written cannot prove anything; Issue turns that into an enrollment.
 		if m.Active == nil {
-			return "", nil, ErrIdentity
+			return "", nil, problem("recovery is impossible: identity/active.json names no credential")
 		}
 		signer, e = key(m.Active.Key)
 		if e != nil {
-			return "", nil, e
+			return "", nil, problem("recovery is impossible: the active credential's private key is unreadable")
 		}
 		cert, e := m.Certificate()
 		if e != nil {
-			return "", nil, e
+			return "", nil, problem("recovery is impossible: the active credential is unreadable or invalid")
 		}
 		h := sha256.Sum256(cert.Leaf.Raw)
 		fingerprint = hex.EncodeToString(h[:])
@@ -461,17 +478,49 @@ func (m *Manager) Issue(ctx context.Context, c *uplink.Connection) error {
 	if p.Kind == "recover" {
 		challenge, sig, e = m.proof(ctx, c, "recover")
 		if e != nil {
-			return e
+			// A server refusal is returned as is. Only a locally impossible
+			// recover falls back, and then only to a valid licence.
+			var impossible *Problem
+			if !errors.As(e, &impossible) {
+				return e
+			}
+			if e = m.enrollInstead(impossible.Reason); e != nil {
+				return e
+			}
+			p = m.Pending
+			request.OperationId, request.Generation, request.CsrPem, request.Token = p.Operation, p.Generation, p.CSR, p.Token
+		} else {
+			request.Challenge = challenge
+			request.SignatureDer = sig
+			request.OldCertificatePem = m.Active.Certificate
 		}
-		request.Challenge = challenge
-		request.SignatureDer = sig
-		request.OldCertificatePem = m.Active.Certificate
 	}
 	f, e := c.Unary(ctx, p.Kind, request)
 	if e != nil {
 		return e
 	}
 	return m.Install(f.GetCredential())
+}
+
+// enrollInstead rewrites a pending recover as an enrollment. It keeps the
+// operation id, key and CSR, so a cloud that already holds the operation sees
+// the same request. Without a valid licence it returns a problem that stops
+// the forward loop rather than retrying a recovery that can never succeed.
+func (m *Manager) enrollInstead(reason string) error {
+	l, e := m.enrollmentLicense(time.Now())
+	if e != nil {
+		var licence *Problem
+		errors.As(e, &licence)
+		return problem(reason + "; " + licence.Reason)
+	}
+	p := *m.Pending
+	p.Kind, p.Generation, p.Token = "enroll", l.Generation, l.Token
+	raw, _ := json.Marshal(&p)
+	if e = durable.Write(filepath.Join(m.Dir, "pending.json"), raw); e != nil {
+		return e
+	}
+	m.Pending = &p
+	return nil
 }
 func (m *Manager) Install(c *pb.Credential) error {
 	p := m.Pending

@@ -122,6 +122,13 @@ func run(path string, check bool) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 	store := config.New(c)
+	// A completed descriptor sync is cached so a restart does not have to wait
+	// for the cloud before remote write starts accepting samples.
+	if items := loadDescriptorCache(filepath.Join(c.StateDir, descriptorCache)); len(items) > 0 {
+		if store.SyncDescriptors(items) {
+			logger.Info("descriptors_loaded", "bindings", len(items), "source", "cache")
+		}
+	}
 	hup := make(chan os.Signal, 1)
 	signal.Notify(hup, syscall.SIGHUP)
 	defer signal.Stop(hup)
@@ -214,7 +221,7 @@ func run(path string, check bool) error {
 	wg.Go(func() { errc <- forward(ctx, store, q, manager, d) })
 	wg.Go(func() { monitor(ctx, q, time.Minute, 15*time.Minute, d) })
 	wg.Go(func() { clockMonitor(ctx, d, manager.Trust.IngestURL, manager.Roots, time.Hour, manager.Active != nil) })
-	logger.Info("gateway_ready", "bindings", len(c.Bindings))
+	logger.Info("gateway_ready", "bindings", len(store.Get().Bindings))
 	for {
 		select {
 		case <-ctx.Done():
@@ -287,6 +294,10 @@ func forward(ctx context.Context, store *config.Store, q *buffer.Queue, m *ident
 					e = x
 				}
 			}
+			if kind == "recover" && m.Pending != nil && m.Pending.Kind != kind {
+				// Issue rewrote the journal because the active credential is gone.
+				logger.Warn("recover_impossible_enrolling", "operation", m.Pending.Kind, "reason", "the stored credential cannot be used for recovery", "hint", "The gateway enrolls again with the licence at its deploymentLicensePath. Buffered data is kept.")
+			}
 			if e == nil && m.Pending == nil {
 				attrs := []any{"operation", kind}
 				if cert, x := m.Certificate(); x == nil {
@@ -317,6 +328,16 @@ func forward(ctx context.Context, store *config.Store, q *buffer.Queue, m *ident
 					logger.Warn("quic_unavailable", "fallback", "h2", "retryQuicAfterMinutes", 30, "hint", "HTTP/3 over UDP 443 failed, so the gateway uses HTTP/2 over TCP. Allow outbound UDP 443, or set uplink.forceTcp to skip the attempt.")
 				}
 				logger.Info("uplink_connected", "transport", conn.Kind)
+				// The cloud resolves the streams behind the configured promql;
+				// the answer is applied locally and never sent upstream by a
+				// writer. It is re-read on every connect and every 15 seconds
+				// below, so streams added in the product after the gateway
+				// started (Step 4 of the wizard, or later) still arrive.
+				if x := syncDescriptors(ctx, conn, store, m.Trust.GatewayID, m.Active.Generation, c.StateDir); x != nil {
+					logger.Warn("descriptors_unavailable", "problem", bounded(x.Error()), "hint", "The cloud could not deliver stream descriptors. Remote-write answers 503 with Retry-After until they arrive, so vmagent keeps the first batch in its WAL.")
+				} else {
+					c = store.Get()
+				}
 				cert, x := m.Certificate()
 				if x != nil {
 					conn.Close()
@@ -330,9 +351,11 @@ func forward(ctx context.Context, store *config.Store, q *buffer.Queue, m *ident
 				if conn.Kind == "h2" && !c.Uplink.ForceTCP && c.Uplink.Proxy == "" && tcpUntil.Before(renewAt) {
 					renewAt = tcpUntil
 				}
+				stopRefresh := startDescriptorRefresh(ctx, conn, store, m.Trust.GatewayID, m.Active.Generation, c.StateDir)
 				e = conn.Run(ctx, q, m.Trust.GatewayID, m.Active.Generation, keys, renewAt, func(offsetMillis int64, unknownKeys []string) {
 					d.observeWelcome(offsetMillis, unknownKeys, c.Bindings)
 				})
+				stopRefresh()
 				backoff = sessionBackoff(backoff, conn.Established)
 				if conn.Established {
 					capacityBackoff = 0

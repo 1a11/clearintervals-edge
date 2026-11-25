@@ -176,7 +176,9 @@ func preflight(raw []byte, desc protoreflect.MessageDescriptor, depth int) bool 
 				case "signature_der":
 					max = 128
 				case "signing_payload":
-					max = 4096
+					// Descriptor answers carry up to 100 JSON-encoded stream
+					// descriptors in POST /uplink/v1/descriptors.
+					max = 65536
 				}
 				if len(payload) > max {
 					return false
