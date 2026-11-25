@@ -1,4 +1,7 @@
-# Disabled until customer credentials, TLS material and immutable product bindings are installed.
+# Modules stay disabled until TLS material and writer credentials are installed.
+# Clear Intervals generates a prefilled config.yaml during gateway setup (Gateway Setup Wizard, Step 1).
+# Use this example only when you write the file by hand. With bindings: [], the gateway fills its
+# bindings automatically from the cloud stream descriptors behind your PromQL after enrollment.
 stateDir: /var/lib/edgegateway
 deploymentLicensePath: /var/lib/edgegateway/enrollment/license.json
 statusListen: 127.0.0.1:9081
@@ -9,7 +12,7 @@ buffer:
 modules:
   remoteWrite:
     enabled: false
-    listen: 127.0.0.1:8429
+    listen: 127.0.0.1:2948
     certificate: ""
     key: ""
     writerCa: ""
