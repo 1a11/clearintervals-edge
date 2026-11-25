@@ -2,7 +2,7 @@
 
 Use this file when asked to install or update the gateway on a customer host. Complete the deployment and verify data delivery when the required access and inputs are available. A request to edit this repository alone does not request a customer deployment.
 
-Read README.md for the license, stream key, billing, and writer setup. Keep public documentation in plain English. Do not add architectural diagrams or arrow navigation.
+Read README.md for the license, writer token, billing, and writer setup. Keep public documentation in plain English. Do not add architectural diagrams or arrow navigation.
 
 ## Required inputs
 
@@ -11,10 +11,10 @@ Use values supplied by the operator or already configured on the target host:
 - Target host and SSH access, with permission to use Docker and sudo.
 - Release commit: the full 40-character commit from a successful public release.
 - Host LAN IPv4 address, gateway DNS name, and writer hosts allowed to connect.
-- Enrollment license for a new installation. Obtain it in the app under Gateways, New gateway, Create and get licence. Download the file when shown.
-- Stream credentials and binding settings for each source. In the app, open the gateway and select Add stream. Save the stream key file when shown. Use the issued binding ID, canonical source ID, and stream key. Do not invent IDs or use a sensor name in place of an ID.
-- Actual writer labels for series selectors, units and scale, and which writers may use each binding.
-- A TLS certificate for the gateway DNS name, its private key, and the CA certificate trusted by the writers. Get these from the site's certificate issuer.
+- Gateway Setup Wizard export for a new installation: the prefilled `config.yaml` (port `2948`, `bindings: []`, and the `vmagent` principal with its `tokenSha256`), the one-time `license.json`, and the writer bearer token that starts with `ci_ingest_`. Download each file when shown.
+- Stream definitions: the sensor or machine each stream targets and its PromQL series selector, built from exact label matchers, for example `vm_motor_temp_celsius{site="north",asset="comp_a",sensor="de_bearing"}`. Each stream uses one gateway sensor slot. Do not invent binding IDs or stream keys.
+- Actual writer labels, units and scale for any stream that needs a local static binding instead of the cloud descriptor.
+- A TLS certificate for the gateway DNS name, its private key, and the CA certificate trusted by the writers, when the wizard's `TLS (Recommended)` mode is used. Get these from the site's certificate issuer.
 - Access to configure the writer's token, CA trust, and remote-write endpoint.
 - An active Gateway add-on with enough gateway sensor slots for vibration streams.
 
@@ -61,28 +61,32 @@ Use these host paths:
 
 | Host path | Container path | Contents |
 | --- | --- | --- |
-| `/srv/edgegateway/config` | `/etc/edgegateway` | Configuration and LAN TLS files, read only |
+| `/srv/edgegateway/config` | `/etc/edgegateway` | Prefilled configuration, read only |
+| `/srv/edgegateway/tls` | `/etc/ssl/certs/own` | Gateway certificate and key for `TLS (Recommended)`, read only |
 | `/srv/edgegateway/state` | `/var/lib/edgegateway` | Gateway identity and queued data, writable |
-| `/srv/edgegateway/state/enrollment/license.json` | `/var/lib/edgegateway/enrollment/license.json` | Downloaded enrollment license |
+| `/srv/edgegateway/state/enrollment/license.json` | `/var/lib/edgegateway/enrollment/license.json` | Downloaded one-time enrollment license |
 
 Create the directories:
 
 ```bash
 sudo install -d -o 65532 -g 65532 -m 0700 \
-  /srv/edgegateway/config /srv/edgegateway/state /srv/edgegateway/state/enrollment
+  /srv/edgegateway/config /srv/edgegateway/tls /srv/edgegateway/state /srv/edgegateway/state/enrollment
 ``` Copy the downloaded license unchanged to the path above with `sudo install -o 65532 -g 65532 -m 0600 "$LICENSE_FILE" /srv/edgegateway/state/enrollment/license.json`. Set `LICENSE_FILE` to its actual local path first. Do this only for a new installation. The gateway removes the file after enrollment; do not restore it on each restart.
 
-Install the TLS certificate and key as `lan-server.pem` and `lan-server.key` in the config directory. Set ownership to 65532:65532 and mode 0600 so the container can read them. Do not use self-signed or placeholder certificates without configuring the writers to trust the issuer.
+For `TLS (Recommended)`, install the gateway certificate and key as `tls.crt` and `tls.key` in `/srv/edgegateway/tls`. The container mounts that directory at `/etc/ssl/certs/own`, which is where the prefilled `config.yaml` looks. Set ownership to 65532:65532 and mode 0600 so the container can read them. When the site stores TLS material elsewhere, edit the two paths in `config.yaml` and mount that directory instead. Do not use self-signed or placeholder certificates without configuring the writers to trust the issuer.
 
-Create `/srv/edgegateway/config/config.yaml` using config.example.yaml and the README example. Set ownership to 65532:65532 and mode 0600. Set:
+Copy the prefilled `config.yaml` from the wizard to `/srv/edgegateway/config/config.yaml` with ownership 65532:65532 and mode 0600. It already sets:
 
-- `stateDir: /var/lib/edgegateway`.
-- `deploymentLicensePath: /var/lib/edgegateway/enrollment/license.json`.
-- `statusListen: 127.0.0.1:9081`; keep status private.
-- `modules.remoteWrite.enabled: true` and `listen: 0.0.0.0:8429` when using remote write.
-- The certificate and key paths under `/etc/edgegateway`.
-- One principal per writer. Generate a random token locally, save the original in that writer's protected credential file, and put only its SHA-256 hex digest in `tokenSha256`. Reuse an existing valid token on repeat deployments.
-- Each binding's issued `id`, `sourceId`, `streamKey`, `kind`, and allowed principal IDs. For `series`, use the real label selector and a nonzero scale. For `captures`, omit selector and scale.
+- `stateDir: /var/lib/edgegateway` and `deploymentLicensePath: /var/lib/edgegateway/enrollment/license.json`.
+- `modules.remoteWrite.enabled: true` with `listen: 0.0.0.0:2948` for `TLS (Recommended)`, or `127.0.0.1:2948` for `Loopback HTTP`.
+- The `vmagent` principal with the one-time bearer token's SHA-256 digest in `tokenSha256`.
+- `bindings: []`, which the gateway fills from cloud stream descriptors after enrollment.
+
+Keep `statusListen: 127.0.0.1:9081` private. The prefilled file already names the certificate and key paths for `TLS (Recommended)`; edit them only when the site stores TLS material elsewhere.
+
+Add a local principal only when a writer other than `vmagent` must send. Generate a random token locally, keep the original in that writer's protected credential file, and put only its SHA-256 hex digest in `tokenSha256`. Reuse an existing valid token on repeat deployments. Do not invent a token for `vmagent`; the wizard's token is the one the writer already holds.
+
+Leave `bindings: []` unless the site needs a local override. The gateway fetches the streams you define in the wizard or on the gateway overview page. A static binding, when needed, uses the issued `id`, `sourceId` and `streamKey`, the `kind`, and for `series` the exact label selector and a nonzero scale; for `captures`, omit selector and scale.
 
 For captures, enable `modules.captures` with its own TLS listener on port 8430 and its own writer principals. Publish that port only when captures are used. Do not leave remote write enabled if it is unused.
 
@@ -109,18 +113,19 @@ docker run -d --name edgegateway --restart unless-stopped \
   --log-opt max-size=10m --log-opt max-file=3 \
   -v /srv/edgegateway/config:/etc/edgegateway:ro \
   -v /srv/edgegateway/state:/var/lib/edgegateway \
-  -p "$LAN_IP:8429:8429" \
+  -v /srv/edgegateway/tls:/etc/ssl/certs/own:ro \
+  -p "$LAN_IP:2948:2948" \
   "$IMAGE_ID"
 ```
 
-For captures, add `-p "$LAN_IP:8430:8430"`. Remove the 8429 mapping for a captures-only deployment. Restrict published ports to the agreed writer hosts using the site's Docker-aware firewall policy. Do not publish port 9081 or open inbound Internet access.
+The `/srv/edgegateway/tls` mount is needed only with `TLS (Recommended)`; omit it and the port mapping in `Loopback HTTP` mode, where a writer in the same network namespace uses `http://127.0.0.1:2948/api/v1/write`. For captures, add `-p "$LAN_IP:8430:8430"`. Remove the 2948 mapping for a captures-only deployment. Restrict published ports to the agreed writer hosts using the site's Docker-aware firewall policy. Do not publish port 9081 or open inbound Internet access.
 
-Configure each writer to use `https://GATEWAY_DNS_NAME:8429/api/v1/write`, its original token, and the CA certificate for the gateway's LAN certificate. Replace `GATEWAY_DNS_NAME` with the supplied name. Preserve existing remote-write destinations. Reload the writer using its supported configuration check and reload procedure. Do not disable TLS verification.
+Configure each writer to use the endpoint from the wizard, `https://GATEWAY_DNS_NAME:2948/api/v1/write`, its one-time bearer token, and the CA certificate for the gateway's certificate. Replace `GATEWAY_DNS_NAME` with the supplied name. Preserve existing remote-write destinations. Reload the writer using its supported configuration check and reload procedure. Do not disable TLS verification.
 
 ## Verify deployment
 
 1. Run `docker inspect --format '{{.State.Status}} {{.RestartCount}}' edgegateway`. It must stay running without repeated restarts.
-2. Check `docker logs --since 5m edgegateway`. Look for `gateway_ready` and `uplink_connected`; a new enrollment also emits `credential_activated`. Investigate retry and rejection events.
+2. Check `docker logs --since 5m edgegateway`. Look for `gateway_ready` and `uplink_connected`; a new enrollment also emits `credential_activated`. After the first stream is added, `descriptors_synced` confirms the cloud descriptor set arrived. Investigate retry and rejection events.
 3. Check the private health endpoint from the container's network namespace. The image has no shell or curl. Use host tools:
 
    ```bash
@@ -128,7 +133,7 @@ Configure each writer to use `https://GATEWAY_DNS_NAME:8429/api/v1/write`, its o
    sudo nsenter -t "$CONTAINER_PID" -n -- curl --noproxy '*' --fail --silent --show-error http://127.0.0.1:9081/healthz
    ```
 
-4. Confirm the gateway's recent heartbeat in the app. Send a real sample from an authorized writer and confirm it appears at the intended sensor or machine. A 200 health response alone does not prove cloud delivery.
+4. Confirm the gateway's recent heartbeat in the app. Step 3 of the wizard reports `Reporting`. Add or confirm a stream in Step 4, or from the gateway overview page, using an exact PromQL selector. While the first descriptor sync is pending, remote write answers `503` with `Retry-After: 15`, so the writer retries and keeps the batch in its WAL. Then send a real sample from an authorized writer and confirm it appears at the intended sensor or machine. A 200 health response alone does not prove cloud delivery.
 5. Allow up to five minutes for initial connection and data checks. If cloud or app access is unavailable, state which checks remain unverified. Do not report full deployment success.
 
 Record the target host, release SHA, image ID, enabled ports, configuration path, and verification results. Include no credentials.

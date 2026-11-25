@@ -24,80 +24,68 @@ The edge gateway runs on your local network and forwards machine telemetry to Cl
 - Linux with Docker (or an OCI runtime), or Go 1.27.3 to build from source.
 - Outbound UDP 443 and/or TCP 443 to your region's ingest host (direct or via HTTP proxy). Exempt the ingest host from TLS inspection.
 - Active NTP on the host. Captures fail if clock drift exceeds 30 s.
-- One enrollment license for the gateway and one stream key per bound sensor (from Clear Intervals).
+- The prefilled `config.yaml`, one-time enrollment `license.json`, and writer bearer token from the Gateway Setup
+  Wizard in Clear Intervals.
 
 ## Quick start
 
-These steps deploy the `remoteWrite` module with Docker. Replace example paths to match your host.
+The Gateway Setup Wizard in Clear Intervals generates the configuration. Its first three steps run on the gateway host, and Step 4 defines the streams.
 
-### 1. Prepare host directories
+### 1. Download configuration and license (Step 1 of wizard)
 
-The container runs as UID/GID `65532` with no shell.
+Step 1 downloads two files and shows the writer token:
 
-```sh
-sudo mkdir -p /srv/edgegateway/config /srv/edgegateway/state/enrollment
-sudo cp license.json /srv/edgegateway/state/enrollment/license.json
-sudo chown -R 65532:65532 /srv/edgegateway/state
-sudo chmod 700 /srv/edgegateway/state && sudo chmod 600 /srv/edgegateway/state/enrollment/license.json
-```
+- `config.yaml`, prefilled with the `vmagent` principal (`tokenSha256`) and `bindings: []`.
+- `license.json`, the one-time enrollment license.
 
-The gateway deletes `license.json` after enrollment succeeds. If the license includes a non-empty `streamBindings` roster, startup fails when a configured binding is missing and warns when a stream key does not match. A freshly downloaded configuration has no bindings and an empty roster: after enrollment the gateway fetches the stream descriptors behind the configured PromQL from the cloud and installs them itself, refreshing them every 15 seconds while connected (see `descriptors_synced`).
+Choose one listener mode in the wizard:
 
-### 2. Create a writer token
+- `TLS (Recommended)`: `listen: 0.0.0.0:2948` with `certificate: /etc/ssl/certs/own/tls.crt` and `key: /etc/ssl/certs/own/tls.key`.
+- `Loopback HTTP`: `listen: 127.0.0.1:2948`, for a writer that shares the gateway's network namespace.
 
-Generate one token per writer. The gateway stores only the SHA-256 hash.
+Place both files on the host, owned by the container's UID/GID `65532:65532`:
 
 ```sh
-TOKEN=$(openssl rand -base64 48)
-printf '%s' "$TOKEN" | sha256sum | cut -d' ' -f1   # copy to tokenSha256
+sudo install -d -o 65532 -g 65532 -m 0700 \
+  /srv/edgegateway/config /srv/edgegateway/state /srv/edgegateway/state/enrollment
+sudo install -o 65532 -g 65532 -m 0600 config.yaml /srv/edgegateway/config/config.yaml
+sudo install -o 65532 -g 65532 -m 0600 license.json /srv/edgegateway/state/enrollment/license.json
 ```
 
-Store `$TOKEN` in the writer's secret store, not in `config.yaml`.
+With `TLS (Recommended)`, also install the gateway's certificate and key at the paths the prefilled file names, readable by UID 65532 inside the container. The example paths are `/etc/ssl/certs/own/tls.crt` and `/etc/ssl/certs/own/tls.key`, and the examples below mount `/srv/edgegateway/tls` there.
 
-### 3. Write the configuration
+`license.json` is single use. The gateway deletes it after enrollment, so do not restore it on later starts.
 
-Copy [`config.example.yaml`](config.example.yaml) to `/srv/edgegateway/config/config.yaml`. Non-loopback listeners require a TLS certificate and key in the same directory.
+### 2. Connect vmagent (Step 2 of wizard)
+
+Step 2 shows the remote-write endpoint and the pre-generated one-time bearer token, which starts with `ci_ingest_`. Copy the `docker-compose.yml` or the Docker or Kubernetes command for your writer and send samples to:
+
+- `https://edgegateway:2948/api/v1/write` with `TLS (Recommended)`.
+- `http://127.0.0.1:2948/api/v1/write` with `Loopback HTTP` in a shared network namespace.
+
+Keep the token in the writer's secret store. The gateway stores only its SHA-256 digest (`tokenSha256`). Your existing remote-write destinations stay as they are; add this endpoint next to them.
+
+### 3. Start the gateway (Step 3 of wizard)
 
 ```yaml
-stateDir: /var/lib/edgegateway
-deploymentLicensePath: /var/lib/edgegateway/enrollment/license.json
-modules:
-  remoteWrite:
-    enabled: true
-    listen: 0.0.0.0:8429
-    certificate: /etc/edgegateway/lan-server.pem
-    key: /etc/edgegateway/lan-server.key
-    principals:
-      - id: vmagent
-        tokenSha256: <output of step 2>
-bindings:
-  - id: <binding version from Clear Intervals>
-    streamKey: <stream key from Clear Intervals>
-    sourceId: <canonical source ID from Clear Intervals>
-    kind: series
-    selector:
-      __name__: machine_speed_rpm
-      machine: pump-1
-    scale: 1
-    principals: [vmagent]
+# docker-compose.yml
+services:
+  edgegateway:
+    image: ghcr.io/1a11/clearintervals-edgegateway@sha256:<digest>
+    container_name: edgegateway
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 512m
+    cpus: 1
+    volumes:
+      - /srv/edgegateway/config:/etc/edgegateway:ro
+      - /srv/edgegateway/state:/var/lib/edgegateway
+      - /srv/edgegateway/tls:/etc/ssl/certs/own:ro
+    ports:
+      - "10.0.0.5:2948:2948"
 ```
-
-### 4. Validate the configuration
-
-Run `-check` to validate the file without opening ports or contacting the cloud:
-
-```sh
-docker run --rm -v /srv/edgegateway/config:/etc/edgegateway:ro \
-  ghcr.io/1a11/clearintervals-edgegateway@sha256:<digest> -check
-```
-
-Validation errors identify the failing field:
-
-```json
-{"level":"ERROR","event":"configuration_invalid","field":"bindings[0].streamKey","problem":"must be the 40-100 character stream key copied from the product"}
-```
-
-### 5. Start the gateway
 
 ```sh
 docker run -d --name edgegateway --restart unless-stopped \
@@ -105,32 +93,33 @@ docker run -d --name edgegateway --restart unless-stopped \
   --memory=512m --cpus=1 \
   -v /srv/edgegateway/config:/etc/edgegateway:ro \
   -v /srv/edgegateway/state:/var/lib/edgegateway \
-  -p 10.0.0.5:8429:8429 \
+  -v /srv/edgegateway/tls:/etc/ssl/certs/own:ro \
+  -p 10.0.0.5:2948:2948 \
   ghcr.io/1a11/clearintervals-edgegateway@sha256:<digest>
 ```
 
-Bind the port to the LAN interface only. Deploy by image digest, not by tag. See [Verifying a release](#verifying-a-release).
+Publish the port on the LAN interface your writers use. The `/srv/edgegateway/tls` mount is needed only with `TLS (Recommended)`; with `Loopback HTTP`, skip it and the port mapping. Deploy by digest, never by tag: see [Verifying a release](#verifying-a-release).
 
-### 6. Configure a writer
+Optionally validate the file first. `-check` reads it without opening ports or contacting the cloud:
 
-**Prometheus:**
-
-```yaml
-remote_write:
-  - url: [https://edgegateway.lan:8429/api/v1/write](https://edgegateway.lan:8429/api/v1/write)
-    authorization:
-      credentials_file: /etc/prometheus/edgegateway.token
-    tls_config:
-      ca_file: /etc/prometheus/edgegateway-ca.pem
-    queue_config:
-      max_samples_per_send: 1000
+```sh
+docker run --rm -v /srv/edgegateway/config:/etc/edgegateway:ro \
+  ghcr.io/1a11/clearintervals-edgegateway@sha256:<digest> -check
 ```
 
-**vmagent:** Add `-remoteWrite.url=https://edgegateway.lan:8429/api/v1/write`, `-remoteWrite.bearerToken=...`, and `-remoteWrite.tlsCAFile=...`. Existing remote-write targets do not change.
+On first start the gateway enrolls with `license.json`, deletes the file, and sends its first heartbeat. `docker logs -f edgegateway` shows `credential_activated` and `uplink_connected`, and Step 3 in the wizard turns green (`Reporting`).
 
-### 7. Verify startup
+### 4. Add streams in Clear Intervals (Step 4 of wizard or Gateway overview)
 
-Run `docker logs -f edgegateway`. Confirm these events appear in order: `identity_loaded`, `listener_started`, `gateway_ready`, `credential_activated`, `uplink_connected`.
+Add a stream in Step 4, or later from the gateway overview page. Pick the target sensor or machine and enter a PromQL series selector with one or more exact label matchers:
+
+```
+vm_motor_temp_celsius{site="north",asset="comp_a",sensor="de_bearing"}
+```
+
+Each stream uses one gateway sensor slot. The gateway polls `POST /uplink/v1/descriptors` when it connects and every 15 seconds, logs `descriptors_synced`, caches the descriptors in `<stateDir>/descriptors.json`, and begins forwarding matching series. You do not download stream key files or edit `config.yaml`.
+
+While the first descriptor sync is pending, `remoteWrite` answers `503` with `Retry-After: 15` for a series that matches no binding yet, so `vmagent` keeps that batch in its WAL.
 
 ## Configuration
 
@@ -144,11 +133,13 @@ The gateway enforces strict YAML. Unknown keys, invalid types, and multiple docu
 | `buffer.maxBytes`, `buffer.maxAgeDays`, `buffer.maxSegments` | Disk buffer limits (defaults: 10 GiB, 7 days, 100,000 segments). |
 | `modules.remoteWrite`, `modules.captures` | Per-module listener, TLS, optional writer CA, and writer principals. |
 | `uplink.proxy`, `uplink.forceTcp` | HTTP CONNECT proxy (or `HTTPS_PROXY`); set `forceTcp: true` to skip QUIC. |
-| `bindings` | Maps source selectors to binding version, stream key, source ID, and allowed principals. |
+| `bindings` | Optional local override for a fixed source set. Empty in the prefilled file; normally filled from cloud stream descriptors. |
 
 - **Environment overrides:** `EDGE_STATE_DIR` overrides `stateDir`. `EDGE_LICENSE_PATH` overrides `deploymentLicensePath`.
 - **Reloads:** Send `SIGHUP` to reload `principals` and `bindings` atomically. All other changes require a restart.
 - **Writer authentication:** Supports bearer tokens (SHA-256), Argon2id passwords (`echo -n "$PASSWORD" | edgegateway -hash-password`), or client certificates.
+- **Local writers:** The prefilled `config.yaml` already carries the `vmagent` principal. To add another writer locally, generate a token with `openssl rand -base64 48`, keep it in that writer's secret store, and put only its SHA-256 hex digest in `tokenSha256`. Alternatively use an Argon2id password or a client certificate with `certificateSha256` and `writerCa`.
+- **Static bindings:** A local `bindings` list is optional. The gateway fills `bindings: []` from the cloud stream descriptors, and a local binding overrides a descriptor with the same ID. Each entry needs `id`, `streamKey`, `sourceId`, `kind` and, for `series`, an exact-label `selector` and a nonzero `scale`.
 - **Full reference:** See [`docs/operations.md`](docs/operations.md) for limits, status codes, buffer behavior, reloads, and root rollover. See [`docs/waveform-ingest.md`](docs/waveform-ingest.md) for the capture module.
 
 ## Logs, health, and troubleshooting
@@ -174,7 +165,7 @@ The gateway writes JSON lines to `stdout`. Every log line includes `event`; erro
 | `stream_keys_rejected` | Cloud does not recognize a configured stream key. Copy the current binding from Clear Intervals. |
 | `stream_key_digest_mismatch` | Configured stream key does not match the license roster. Update the rotated or mistyped key. |
 | `descriptors_synced`, `descriptors_unavailable`, `descriptors_cache_failed` | Stream descriptors were applied from the cloud (`cloud`) or the startup cache; a failed fetch holds remote write at `503` with `Retry-After: 15`; the cache could not be written but the descriptors are active. |
-| `records_dropped`, `dropReason` `unmapped` | Incoming series match no binding selector. Check `bindings[].selector` labels. |
+| `records_dropped`, `dropReason` `unmapped` | Incoming series match no binding. Check the stream's PromQL selector in Clear Intervals, or a static `bindings[].selector`. |
 | Writer receives `401` or `403` | Invalid token, or the writer principal is not listed on the matched binding. |
 | `buffer_integrity_alarm` | Disk error or corrupt segment. Inspect the disk; corrupt segments move to `.bad`. |
 

@@ -10,17 +10,20 @@ Mount the whole enrollment directory writable so the one-time bundle can be remo
 
 ## Configure remote write
 
-Generate a random 32-byte-or-longer token on the customer host. Put only its SHA-256 hex digest in a principal's `tokenSha256`; put the token in the writer's own secret store. Authentication compares digests in constant time. Alternatively pin a writer leaf's SHA-256 DER fingerprint with `certificateSha256` and configure `writerCa` for client-chain validation. Each principal uses one method. Basic authentication uses the principal ID as username and a generated high-entropy password. Generate its salted PHC hash locally with `edgegateway -hash-password` reading stdin and place the result in `passwordHash`; never pass the password as a command-line argument. The only accepted Argon2id profile is 64 MiB, three passes and one lane with a 16-byte random salt and 32-byte digest. Two password workers bound memory to 128 MiB; saturation returns 429. Arbitrary PHC cost parameters are rejected before hashing.
+Clear Intervals generates the configuration. The Gateway Setup Wizard downloads a `config.yaml` that already enables `modules.remoteWrite`, carries the `vmagent` principal with its `tokenSha256`, and sets `bindings: []`, together with the one-time `license.json`. Start the gateway with those two files, and add the writer endpoint the wizard shows: `https://edgegateway:2948/api/v1/write`, or `http://127.0.0.1:2948/api/v1/write` in a shared network namespace. There is no stream key file to download and no binding to write by hand.
 
-For every source, copy its immutable binding ID, stream key and canonical device ID from the product. Configure an exact-label selector, source-to-core unit scale, and allowed principals:
+The cloud defines the streams. After enrollment the gateway polls `POST /uplink/v1/descriptors`, on every connect and every 15 seconds while a session is open. Each answer replaces the cloud set, every configured remote-write principal is allowed on each series descriptor, and a descriptor without a scale uses 1. The gateway logs `descriptors_synced`, caches the last answer in `<stateDir>/descriptors.json`, and starts from that cache after a restart. While the first sync is pending, a series that matches no binding yet returns `503` with `Retry-After: 15`, so the writer keeps the batch in its WAL instead of losing it.
+
+A static `bindings` list is an optional local override for a fixed source set. A file binding wins over a descriptor with the same ID, and `SIGHUP` reloads principals and bindings without dropping the cloud set. Each entry names the issued binding ID, the gateway-specific stream key, the canonical source, the kind and, for `series`, an exact-label selector and a nonzero scale:
 
 ```yaml
+# optional local override; the wizard normally leaves this empty
 modules:
   remoteWrite:
     enabled: true
-    listen: 0.0.0.0:8429
-    certificate: /etc/edgegateway/lan-server.pem
-    key: /etc/edgegateway/lan-server.key
+    listen: 0.0.0.0:2948
+    certificate: /etc/ssl/certs/own/tls.crt
+    key: /etc/ssl/certs/own/tls.key
     writerCa: ""
     principals:
       - id: vmagent
@@ -37,7 +40,9 @@ bindings:
     principals: [vmagent]
 ```
 
-Configure Prometheus `remote_write.url` or vmagent `-remoteWrite.url` as `https://customer-gateway:8429/api/v1/write`, configure its bearer token and customer CA, and keep certificate verification enabled. Use remote write 1.0 (`application/x-protobuf`, version header `0.1.0`, snappy; negotiated `Content-Encoding: zstd` also works). Set batches to at most 1,000 total samples/series per request. Each series has at most 64 distinct labels, names at most 128 bytes and values at most 1,024 bytes. Remote write 2.0, exemplars, native histograms and metadata extensions are refused. Non-finite values and negative zero are invalid. Labels are used only for filtering and never leave the module.
+When you add or replace a writer principal locally, generate a random 32-byte-or-longer token on the customer host. Put only its SHA-256 hex digest in a principal's `tokenSha256`; put the token in the writer's own secret store. Authentication compares digests in constant time. Alternatively pin a writer leaf's SHA-256 DER fingerprint with `certificateSha256` and configure `writerCa` for client-chain validation. Each principal uses one method. Basic authentication uses the principal ID as username and a generated high-entropy password. Generate its salted PHC hash locally with `edgegateway -hash-password` reading stdin and place the result in `passwordHash`; never pass the password as a command-line argument. The only accepted Argon2id profile is 64 MiB, three passes and one lane with a 16-byte random salt and 32-byte digest. Two password workers bound memory to 128 MiB; saturation returns 429. Arbitrary PHC cost parameters are rejected before hashing.
+
+Configure Prometheus `remote_write.url` or vmagent `-remoteWrite.url` as `https://customer-gateway:2948/api/v1/write`, configure its bearer token and customer CA, and keep certificate verification enabled. Use remote write 1.0 (`application/x-protobuf`, version header `0.1.0`, snappy; negotiated `Content-Encoding: zstd` also works). Set batches to at most 1,000 total samples/series per request. Each series has at most 64 distinct labels, names at most 128 bytes and values at most 1,024 bytes. Remote write 2.0, exemplars, native histograms and metadata extensions are refused. Non-finite values and negative zero are invalid. Labels are used only for filtering and never leave the module.
 
 Only one binding may match a series. An otherwise valid series matching a binding outside the authenticated writer's allowlist returns 403 for the whole request; it is never reclassified as unmapped. A gateway started from the product's downloaded configuration has no bindings of its own: it receives them from the cloud after enrollment (see `descriptors_synced` below). Until the first descriptor sync completes, a request whose series match no binding yet returns `503 Service Unavailable` with `Retry-After: 15` instead of being discarded, so the writer keeps that first batch in its WAL. The same hold applies after a restart until the cached `descriptors.json` in the state directory or the cloud supplies the bindings. Once a binding set is known (from the file, or from a completed sync even when it returned no streams) unmapped or expired input is deliberately discarded with durable aggregate counters. During a known authenticated suspension, valid authorized input is deliberately dropped with a durable suspended counter; eligible old backlog remains on disk. An explicit authenticated active heartbeat is required to resume it.
 
