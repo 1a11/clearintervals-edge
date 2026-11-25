@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"strings"
 	"testing"
@@ -204,5 +205,51 @@ func TestVerboseOffWritesNothing(t *testing.T) {
 	}
 	if strings.Contains(buf.String(), "verbose_") {
 		t.Fatalf("verbose events written while disabled: %s", buf.String())
+	}
+}
+
+// A Kubernetes block carries tens of thousands of unmapped series. Logging each one would flood stdout, so only
+// the first few and any near-miss on a configured metric are logged in full and the rest are summarized.
+func TestVerboseUnmappedBatchesAreSummarized(t *testing.T) {
+	buf := verboseCapture(t)
+	m, q := module(t)
+	m.Config.Get().Bindings[0].Selector["instance"] = "target"
+	at := time.Now().UnixMilli()
+	batch := make([][]byte, 0, 27)
+	for i := 0; i < 25; i++ {
+		batch = append(batch, timeSeries(map[string]string{"__name__": "kube_pod_info", "pod": fmt.Sprintf("p-%d", i)}, 1, at))
+	}
+	batch = append(batch, timeSeries(map[string]string{"__name__": "rpm", "instance": "other"}, 2, at))
+	batch = append(batch, timeSeries(map[string]string{"__name__": "rpm", "instance": "target"}, 3, at))
+	if w := submit(m, snappyEncode(bytes.Join(batch, nil)), testToken, "snappy"); w.Code != 204 {
+		t.Fatalf("batch refused: %d", w.Code)
+	}
+
+	events := verboseEvents(t, buf)
+	unmapped, nearMisses, matched := 0, 0, 0
+	for _, e := range named(events, "verbose_remotewrite_series") {
+		switch e["outcome"] {
+		case "matched":
+			matched++
+		case "unmapped":
+			unmapped++
+			if labels, ok := e["labels"].(map[string]any); ok && labels["__name__"] == "rpm" {
+				nearMisses++
+			}
+		}
+	}
+	if matched != 1 || unmapped != 21 || nearMisses != 1 {
+		t.Fatalf("matched %d, unmapped logs %d, near-misses %d", matched, unmapped, nearMisses)
+	}
+	summary := named(events, "verbose_remotewrite_unmapped_summary")
+	if len(summary) != 1 || summary[0]["totalUnmappedSeries"] != float64(26) || summary[0]["totalUnmappedSamples"] != float64(26) {
+		t.Fatalf("summary: %v", summary)
+	}
+	names, ok := summary[0]["sampleMetricNames"].([]any)
+	if !ok || len(names) != 2 || names[0] != "kube_pod_info" || names[1] != "rpm" {
+		t.Fatalf("summary metric names: %v", summary[0]["sampleMetricNames"])
+	}
+	if stats, _, _ := q.Snapshot(); stats.Drops["unmapped"] != 26 {
+		t.Fatalf("unmapped accounting: %v", stats.Drops)
 	}
 }

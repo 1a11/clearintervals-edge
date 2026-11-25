@@ -132,11 +132,14 @@ The gateway enforces strict YAML. Unknown keys, invalid types, and multiple docu
 | `statusListen` | Loopback address for `/healthz` and `/metrics` (default: `127.0.0.1:9081`). |
 | `buffer.maxBytes`, `buffer.maxAgeDays`, `buffer.maxSegments` | Disk buffer limits (defaults: 10 GiB, 7 days, 100,000 segments). |
 | `modules.remoteWrite`, `modules.captures` | Per-module listener, TLS, optional writer CA, and writer principals. |
+| `modules.remoteWrite.maxSamples` | Series and samples allowed in one vmagent block (default `250000`, maximum `10000000`). Raise it for a cluster with tens of thousands of series. |
+| `modules.remoteWrite.maxBodyBytes` | Compressed request body limit (default `16777216`, maximum `268435456`). |
+| `modules.remoteWrite.maxDecodedBytes` | Decoded request body limit (default `67108864`, maximum `536870912`). |
 | `uplink.proxy`, `uplink.forceTcp` | HTTP CONNECT proxy (or `HTTPS_PROXY`); set `forceTcp: true` to skip QUIC. |
 | `bindings` | Optional local override for a fixed source set. Empty in the prefilled file; normally filled from cloud stream descriptors. |
 
-- **Environment overrides:** `EDGE_STATE_DIR` overrides `stateDir`. `EDGE_LICENSE_PATH` overrides `deploymentLicensePath`.
-- **Reloads:** Send `SIGHUP` to reload `principals` and `bindings` atomically. All other changes require a restart.
+- **Environment overrides:** `EDGE_STATE_DIR` overrides `stateDir`. `EDGE_LICENSE_PATH` overrides `deploymentLicensePath`. `EDGE_REMOTEWRITE_MAX_SAMPLES`, `EDGE_REMOTEWRITE_MAX_BODY_BYTES` and `EDGE_REMOTEWRITE_MAX_DECODED_BYTES` override the remote-write limits.
+- **Reloads:** Send `SIGHUP` to reload `principals`, `bindings` and the remote-write limits atomically. All other changes require a restart.
 - **Writer authentication:** Supports bearer tokens (SHA-256), Argon2id passwords (`echo -n "$PASSWORD" | edgegateway -hash-password`), or client certificates.
 - **Local writers:** The prefilled `config.yaml` already carries the `vmagent` principal. To add another writer locally, generate a token with `openssl rand -base64 48`, keep it in that writer's secret store, and put only its SHA-256 hex digest in `tokenSha256`. Alternatively use an Argon2id password or a client certificate with `certificateSha256` and `writerCa`.
 - **Static bindings:** A local `bindings` list is optional. The gateway fills `bindings: []` from the cloud stream descriptors, and a local binding overrides a descriptor with the same ID. Each entry needs `id`, `streamKey`, `sourceId`, `kind` and, for `series`, an exact-label `selector` and a nonzero `scale`.
@@ -185,7 +188,8 @@ Turn it on in any of three ways:
 | `verbose_listener_conn`, `verbose_listener_error` | Raw writer connections (`accepted`, `active`, `closed`, peer address) and the HTTP or TLS handshake error the normal server log discards, for example a writer with the wrong CA. |
 | `verbose_remotewrite_request`, `verbose_remotewrite_auth` | Every POST: URI, protocol, full headers including `Authorization`, and the bearer digest compared with each principal's `tokenSha256`. |
 | `verbose_remotewrite_payload` | Compressed and decoded byte counts, series and sample counts, or the exact read, decompression or protobuf error. |
-| `verbose_remotewrite_series`, `verbose_remotewrite_rejected` | Each series with all labels and samples: matched (`bindingId`, `sourceId`, `streamKey`, scaled value), unmapped with a per-binding label diff, held at `503` until descriptors arrive, or rejected with the status and reason. |
+| `verbose_remotewrite_series`, `verbose_remotewrite_rejected` | Each matched, held or rejected series with all labels and samples. Unmapped series are logged in full for the first 20 and for any metric a binding selects, with a per-binding label diff. |
+| `verbose_remotewrite_unmapped_summary` | The rest of a large unmapped batch: `totalUnmappedSeries`, `totalUnmappedSamples` and the metric names seen, so 40,000 series do not flood stdout. |
 | `verbose_descriptor_poll`, `verbose_descriptor_response`, `verbose_active_selectors` | The descriptor request, the cloud's full answer or error, and every selector the gateway matches against. |
 | `verbose_uplink_dial` | The QUIC `h3` attempt and the TCP `h2` fallback or proxy `CONNECT`, with the TLS version, ALPN and the server certificate subject and SHA-256. |
 | `verbose_uplink_welcome`, `verbose_uplink_heartbeat` | Session open (session id, transport, capabilities, clock offset) and each heartbeat with buffer and counter totals. |
