@@ -68,7 +68,7 @@ jobs:
           docker buildx build --push --provenance=mode=max --sbom=true \
             --build-arg "VERSION=$SOURCE_SHA" \
             --label "org.opencontainers.image.revision=$SOURCE_SHA" \
-            --tag "$target:sha-$SOURCE_SHA" --metadata-file image-metadata.json .
+            --tag "$target:sha-$SOURCE_SHA" --tag "$target:latest" --metadata-file image-metadata.json .
           digest=$(python3 -c "import json; print(json.load(open('image-metadata.json'))['containerimage.digest'])")
           echo "ref=$target@$digest" >> "$GITHUB_OUTPUT"
       - name: Scan exact image and export CycloneDX SBOM

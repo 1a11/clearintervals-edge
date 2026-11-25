@@ -11,6 +11,7 @@ import (
 	"github.com/1a11/clearintervals-edge/internal/captures"
 	"github.com/1a11/clearintervals-edge/internal/clock"
 	"github.com/1a11/clearintervals-edge/internal/config"
+	"github.com/1a11/clearintervals-edge/internal/diag"
 	"github.com/1a11/clearintervals-edge/internal/durable"
 	"github.com/1a11/clearintervals-edge/internal/httpauth"
 	"github.com/1a11/clearintervals-edge/internal/identity"
@@ -39,6 +40,7 @@ func main() {
 	path := flag.String("config", "/etc/edgegateway/config.yaml", "Local configuration")
 	check := flag.Bool("check", false, "Validate configuration without opening listeners or sending data")
 	showVersion := flag.Bool("version", false, "Print the release version and exit")
+	verbose := flag.Bool("verbose", false, "Write detailed, unredacted diagnostic events for ingestion, label matching and uplink debugging (same as EDGE_VERBOSE=1 or verbose: true)")
 	flag.Parse()
 	if *showVersion {
 		fmt.Println(version)
@@ -58,7 +60,7 @@ func main() {
 		fmt.Println(value)
 		return
 	}
-	if e := run(*path, *check); e != nil {
+	if e := run(*path, *check, *verbose); e != nil {
 		if *check {
 			logger.Error("configuration_invalid", stopAttrs(e)...)
 		} else {
@@ -67,10 +69,18 @@ func main() {
 		os.Exit(1)
 	}
 }
-func run(path string, check bool) error {
+func run(path string, check bool, verbose bool) error {
 	c, e := config.Load(path)
 	if e != nil {
 		return e
+	}
+	if verbose {
+		c.Verbose = true
+	}
+	if c.Verbose {
+		// Verbose mode logs what normal mode deliberately withholds: tokens, stream keys, labels and values.
+		diag.Set(logger, true)
+		diag.Event("verbose_config_loaded", verboseConfig(c, path)...)
 	}
 	if check {
 		logger.Info("configuration_valid", "config", path, "remoteWrite", c.Modules.RemoteWrite.Enabled, "captures", c.Modules.Captures.Enabled, "bindings", len(c.Bindings))
@@ -128,6 +138,7 @@ func run(path string, check bool) error {
 		if store.SyncDescriptors(items) {
 			logger.Info("descriptors_loaded", "bindings", len(items), "source", "cache")
 		}
+		diag.Event("verbose_active_selectors", "source", "cache", "bindings", activeBindings(store.Get()))
 	}
 	hup := make(chan os.Signal, 1)
 	signal.Notify(hup, syscall.SIGHUP)
@@ -151,7 +162,20 @@ func run(path string, check bool) error {
 		}
 		logger.Info("listener_started", "listener", name, "address", listener.Addr().String(), "tls", tlsConfig != nil)
 		listener = &limitedListener{Listener: listener, slots: make(chan struct{}, connectionLimit)}
-		s := &http.Server{Handler: h, ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 30 * time.Second, MaxHeaderBytes: 8192, ErrorLog: log.New(noLog{}, "", 0), TLSConfig: tlsConfig}
+		// Normally the server's own error log is discarded. In verbose mode it becomes the only place a TLS
+		// handshake failure is visible: a writer with the wrong CA is dropped before any HTTP request exists.
+		errorLog := log.New(noLog{}, "", 0)
+		if diag.Enabled() {
+			errorLog = log.New(verboseWriter{}, "", 0)
+		}
+		s := &http.Server{Handler: h, ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 30 * time.Second, MaxHeaderBytes: 8192, ErrorLog: errorLog, TLSConfig: tlsConfig}
+		s.ConnState = func(c net.Conn, state http.ConnState) {
+			if !diag.Enabled() {
+				return
+			}
+			diag.Event("verbose_listener_conn", "listener", name, "state", connState(state),
+				"remoteAddr", c.RemoteAddr().String(), "localAddr", c.LocalAddr().String())
+		}
 		servers = append(servers, s)
 		wg.Go(func() {
 			var e error
@@ -333,7 +357,7 @@ func forward(ctx context.Context, store *config.Store, q *buffer.Queue, m *ident
 				// writer. It is re-read on every connect and every 15 seconds
 				// below, so streams added in the product after the gateway
 				// started (Step 4 of the wizard, or later) still arrive.
-				if x := syncDescriptors(ctx, conn, store, m.Trust.GatewayID, m.Active.Generation, c.StateDir); x != nil {
+				if x := syncDescriptors(ctx, conn, store, m.Trust.GatewayID, m.Active.Generation, c.StateDir, m.Trust.IngestURL); x != nil {
 					logger.Warn("descriptors_unavailable", "problem", bounded(x.Error()), "hint", "The cloud could not deliver stream descriptors. Remote-write answers 503 with Retry-After until they arrive, so vmagent keeps the first batch in its WAL.")
 				} else {
 					c = store.Get()
@@ -351,7 +375,7 @@ func forward(ctx context.Context, store *config.Store, q *buffer.Queue, m *ident
 				if conn.Kind == "h2" && !c.Uplink.ForceTCP && c.Uplink.Proxy == "" && tcpUntil.Before(renewAt) {
 					renewAt = tcpUntil
 				}
-				stopRefresh := startDescriptorRefresh(ctx, conn, store, m.Trust.GatewayID, m.Active.Generation, c.StateDir)
+				stopRefresh := startDescriptorRefresh(ctx, conn, store, m.Trust.GatewayID, m.Active.Generation, c.StateDir, m.Trust.IngestURL)
 				e = conn.Run(ctx, q, m.Trust.GatewayID, m.Active.Generation, keys, renewAt, func(offsetMillis int64, unknownKeys []string) {
 					d.observeWelcome(offsetMillis, unknownKeys, c.Bindings)
 				})
@@ -419,6 +443,32 @@ type noLog struct{}
 
 func (noLog) Write(b []byte) (int, error) { return len(b), nil }
 
+// verboseWriter turns http.Server and TLS handshake errors into verbose events, so a failed writer handshake is
+// visible with its peer address instead of being discarded.
+type verboseWriter struct{}
+
+func (verboseWriter) Write(b []byte) (int, error) {
+	diag.Event("verbose_listener_error", "error", strings.TrimSpace(string(b)))
+	return len(b), nil
+}
+
+// connState names the lifecycle points worth logging for a writer connection.
+func connState(state http.ConnState) string {
+	switch state {
+	case http.StateNew:
+		return "accepted"
+	case http.StateActive:
+		return "active"
+	case http.StateIdle:
+		return "idle"
+	case http.StateClosed:
+		return "closed"
+	case http.StateHijacked:
+		return "hijacked"
+	}
+	return "unknown"
+}
+
 type limitedListener struct {
 	net.Listener
 	slots chan struct{}
@@ -459,4 +509,39 @@ func sessionBackoff(previous time.Duration, established bool) time.Duration {
 func capacityRetry(streak time.Duration, failure *uplink.Failure) (time.Duration, time.Duration) {
 	wait := max(retryBackoff(0, failure), min(streak, time.Minute))
 	return wait, min(wait*2, time.Minute)
+}
+
+// verboseConfig is the whole effective configuration, unredacted. It answers "what did the gateway actually
+// load" before any traffic flows: paths, listeners, principals, uplink transport and static bindings.
+func verboseConfig(c *config.Config, path string) []any {
+	listener := func(l config.Listener) map[string]any {
+		principals := make([]map[string]any, 0, len(l.Principals))
+		for _, p := range l.Principals {
+			principals = append(principals, map[string]any{
+				"id": p.ID, "tokenSha256": p.TokenSHA256,
+				"certificateSha256": p.CertificateSHA256, "passwordHash": p.PasswordHash,
+			})
+		}
+		return map[string]any{
+			"enabled": l.Enabled, "listen": l.Listen, "certificate": l.Certificate,
+			"key": l.Key, "writerCa": l.WriterCA, "principals": principals,
+		}
+	}
+	bindings := make([]map[string]any, 0, len(c.Bindings))
+	for _, b := range c.Bindings {
+		bindings = append(bindings, map[string]any{
+			"id": b.ID, "sourceId": b.SourceID, "streamKey": b.StreamKey, "kind": b.Kind,
+			"selector": b.Selector, "scale": b.Scale, "principals": b.Principals,
+		})
+	}
+	return []any{
+		"config", path,
+		"stateDir", c.StateDir,
+		"deploymentLicensePath", c.DeploymentLicensePath,
+		"statusListen", c.StatusListen,
+		"remoteWrite", listener(c.Modules.RemoteWrite),
+		"captures", listener(c.Modules.Captures),
+		"uplink", map[string]any{"forceTcp": c.Uplink.ForceTCP, "proxy": c.Uplink.Proxy},
+		"bindings", bindings,
+	}
 }

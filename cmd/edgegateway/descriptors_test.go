@@ -33,7 +33,7 @@ func TestSyncDescriptorsPicksUpStreamsAddedLater(t *testing.T) {
 	store := config.New(c)
 	source := &fakeDescriptors{}
 
-	if e := syncDescriptors(context.Background(), source, store, "gateway", 7, dir); e != nil {
+	if e := syncDescriptors(context.Background(), source, store, "gateway", 7, dir, "https://ingest.example"); e != nil {
 		t.Fatal(e)
 	}
 	if !store.DescriptorsSynced() {
@@ -50,7 +50,7 @@ func TestSyncDescriptorsPicksUpStreamsAddedLater(t *testing.T) {
 		Kind:      "series",
 		Selector:  map[string]string{"__name__": "rpm"},
 	}}
-	if e := syncDescriptors(context.Background(), source, store, "gateway", 7, dir); e != nil {
+	if e := syncDescriptors(context.Background(), source, store, "gateway", 7, dir, "https://ingest.example"); e != nil {
 		t.Fatal(e)
 	}
 	b := store.Get().Bindings

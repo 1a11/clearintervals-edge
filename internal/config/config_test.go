@@ -209,3 +209,30 @@ func TestDescriptorsSyncWithNoDescriptorsCompletesTheWait(t *testing.T) {
 		t.Fatal("empty sync did not complete the wait")
 	}
 }
+
+// Verbose mode is off unless the file, the environment or the CLI asks for it. The environment wins, so a
+// debugging session can turn it on without editing the configuration.
+func TestVerboseFromFileAndEnvironment(t *testing.T) {
+	c := valid(t)
+	c.Buffer.MaxAgeDays = 7
+	c.Buffer.MaxBytes = 1 << 20
+	c.Buffer.MaxSegments = 100
+	c.Verbose = true
+	loaded, e := load(t, c)
+	if e != nil || !loaded.Verbose {
+		t.Fatalf("verbose: true not loaded: %v %v", loaded, e)
+	}
+	for value, want := range map[string]bool{"1": true, "true": true, "TRUE": true, "0": false, "false": false} {
+		t.Setenv("EDGE_VERBOSE", value)
+		loaded, e = load(t, c)
+		if e != nil || loaded.Verbose != want {
+			t.Fatalf("EDGE_VERBOSE=%q gave verbose=%v (%v), want %v", value, loaded.Verbose, e, want)
+		}
+	}
+	// The environment can also turn verbose off when the file enables it.
+	t.Setenv("EDGE_VERBOSE", "0")
+	c.Verbose = true
+	if loaded, e = load(t, c); e != nil || loaded.Verbose {
+		t.Fatalf("EDGE_VERBOSE=0 did not override verbose: true: %v %v", loaded, e)
+	}
+}
