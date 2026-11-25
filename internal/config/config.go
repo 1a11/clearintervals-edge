@@ -68,7 +68,9 @@ type Config struct {
 	DeploymentLicensePath string `yaml:"deploymentLicensePath"`
 	StateDir              string `yaml:"stateDir"`
 	StatusListen          string `yaml:"statusListen"`
-	Buffer                struct {
+	// Verbose writes detailed, unredacted diagnostic events (labels, tokens, stream keys, sample values).
+	Verbose bool `yaml:"verbose"`
+	Buffer  struct {
 		MaxBytes    int64 `yaml:"maxBytes"`
 		MaxAgeDays  int   `yaml:"maxAgeDays"`
 		MaxSegments int   `yaml:"maxSegments"`
@@ -118,6 +120,9 @@ func Load(path string) (*Config, error) {
 	}
 	if v := os.Getenv("EDGE_LICENSE_PATH"); v != "" {
 		c.DeploymentLicensePath = v
+	}
+	if v := strings.TrimSpace(os.Getenv("EDGE_VERBOSE")); v != "" {
+		c.Verbose = v == "1" || strings.EqualFold(v, "true")
 	}
 	if c.Uplink.Proxy == "" {
 		c.Uplink.Proxy = os.Getenv("HTTPS_PROXY")

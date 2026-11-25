@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"github.com/1a11/clearintervals-edge/internal/buffer"
+	"github.com/1a11/clearintervals-edge/internal/diag"
 	"github.com/1a11/clearintervals-edge/internal/wire"
 	pb "github.com/1a11/clearintervals-edge/protocol/v1"
 	"google.golang.org/protobuf/proto"
@@ -55,6 +56,10 @@ func (c *Connection) run(ctx context.Context, q *buffer.Queue, gid string, gener
 		return wire.ErrFrame
 	}
 	c.Established = true
+	diag.Event("verbose_uplink_welcome", "gatewayId", gid, "generation", generation, "sessionId", welcome.SessionId,
+		"transport", c.Kind, "streamKeys", keys, "unknownStreamKeys", welcome.UnknownStreamKeys,
+		"capabilities", welcome.Capabilities, "clockOffsetMillis", welcome.ClockOffsetMillis,
+		"maxStreams", welcome.MaxStreams, "maxFrameBytes", welcome.MaxFrameBytes)
 	if onWelcome != nil {
 		// The cloud reports its clock and the keys it does not know; neither is
 		// fatal to the session, so the caller decides how loudly to surface them.
@@ -101,6 +106,8 @@ func (c *Connection) run(ctx context.Context, q *buffer.Queue, gid string, gener
 			if e = q.SetPolicy("active"); e != nil {
 				return e
 			}
+			diag.Event("verbose_uplink_heartbeat", "sessionId", sid, "bufferBytes", size, "records", stats.Accepted,
+				"bytes", stats.Bytes, "drops", drops, "rejected", stats.Rejected, "policyState", policy.State)
 			heartbeat = time.Now()
 		}
 		entries, e := q.NextBatch(time.Now())
@@ -195,6 +202,8 @@ func (c *Connection) run(ctx context.Context, q *buffer.Queue, gid string, gener
 		s.sequence++
 		s.usedBytes += size
 		s.usedItems += uint64(len(items))
+		diag.Event("verbose_uplink_batch_send", "sessionId", sid, "epoch", s.epoch, "kind", kind,
+			"sequence", s.sequence, "frameBytes", size, "items", describeItems(items))
 		reply, e := s.channel.Exchange(frame)
 		if e != nil {
 			retry := time.Second
@@ -216,6 +225,8 @@ func (c *Connection) run(ctx context.Context, q *buffer.Queue, gid string, gener
 		if e = q.Resolve(entries, ack, sid, s.epoch, s.sequence); e != nil {
 			return e
 		}
+		diag.Event("verbose_uplink_batch_ack", "sessionId", sid, "epoch", s.epoch, "sequence", s.sequence,
+			"terminalFrontier", ack.TerminalFrontier, "results", describeResults(ack.Results))
 		if ack.Credit != nil {
 			if e = acceptCredit(ack.Credit, sid, s.epoch, "", s.credit); e != nil {
 				return e
@@ -248,4 +259,35 @@ func pause(ctx context.Context, d time.Duration) error {
 	case <-timer.C:
 		return nil
 	}
+}
+
+// describeItems renders a batch for verbose logs: identity, target stream and the point it carries.
+func describeItems(items []*pb.Item) []map[string]any {
+	out := make([]map[string]any, 0, len(items))
+	for _, i := range items {
+		entry := map[string]any{"id": i.Id, "bindingId": i.BindingId, "sourceId": i.SourceId, "streamKey": i.StreamKey}
+		switch body := i.Body.(type) {
+		case *pb.Item_Point:
+			entry["timestamp"] = body.Point.Timestamp
+			entry["value"] = body.Point.Value
+		case *pb.Item_Capture:
+			entry["bodyKind"] = "capture"
+		case *pb.Item_Event:
+			entry["bodyKind"] = "event"
+		default:
+			entry["bodyKind"] = "unknown"
+		}
+		out = append(out, entry)
+	}
+	return out
+}
+
+// describeResults renders the cloud's per-item answer, including the code and retry time on a refusal.
+func describeResults(results []*pb.Result) []map[string]any {
+	out := make([]map[string]any, 0, len(results))
+	for _, r := range results {
+		out = append(out, map[string]any{"id": r.Id, "outcome": r.Outcome.String(),
+			"code": r.Code, "retryAfterSeconds": r.RetryAfterSeconds})
+	}
+	return out
 }

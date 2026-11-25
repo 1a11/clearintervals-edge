@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/1a11/clearintervals-edge/internal/config"
+	"github.com/1a11/clearintervals-edge/internal/diag"
 	"github.com/1a11/clearintervals-edge/internal/durable"
 	"github.com/1a11/clearintervals-edge/internal/uplink"
 )
@@ -44,13 +45,18 @@ type descriptorCacheFile struct {
 // outbound only: nothing here answers an incoming request, and the gateway is
 // the only party that talks to the cloud. Calling it again replaces the cloud
 // set, so streams added in the product start flowing without a restart.
-func syncDescriptors(ctx context.Context, source descriptorSource, store *config.Store, gid string, generation uint64, stateDir string) error {
+func syncDescriptors(ctx context.Context, source descriptorSource, store *config.Store, gid string, generation uint64, stateDir, ingestURL string) error {
+	diag.Event("verbose_descriptor_poll", "gatewayId", gid, "generation", generation, "ingestUrl", ingestURL)
 	fetched, e := source.Descriptors(ctx, gid, generation)
 	if e != nil {
+		diag.Event("verbose_descriptor_response", "error", e.Error())
 		return e
 	}
+	diag.Event("verbose_descriptor_response", "count", len(fetched), "descriptors", describeDescriptors(fetched))
 	if len(fetched) > maxDescriptors {
-		return fmt.Errorf("descriptors_too_many: the cloud returned %d descriptors, at most %d are supported", len(fetched), maxDescriptors)
+		e = fmt.Errorf("descriptors_too_many: the cloud returned %d descriptors, at most %d are supported", len(fetched), maxDescriptors)
+		diag.Event("verbose_descriptor_response", "error", e.Error())
+		return e
 	}
 	items := make([]config.Binding, 0, len(fetched))
 	for _, d := range fetched {
@@ -59,6 +65,7 @@ func syncDescriptors(ctx context.Context, source descriptorSource, store *config
 	if store.SyncDescriptors(items) {
 		logger.Info("descriptors_synced", "bindings", len(items), "source", "cloud")
 	}
+	diag.Event("verbose_active_selectors", "source", "cloud", "bindings", activeBindings(store.Get()))
 	if e = saveDescriptorCache(filepath.Join(stateDir, descriptorCache), items); e != nil {
 		logger.Warn("descriptors_cache_failed", "problem", bounded(e.Error()), "hint", "The descriptors are active but were not cached; they will be fetched again after a restart.")
 	}
@@ -68,7 +75,7 @@ func syncDescriptors(ctx context.Context, source descriptorSource, store *config
 // startDescriptorRefresh keeps re-reading the cloud descriptor set while the
 // session is open. The returned stop function cancels an in-flight fetch and
 // waits for the loop, so the caller can close the connection safely.
-func startDescriptorRefresh(ctx context.Context, source descriptorSource, store *config.Store, gid string, generation uint64, stateDir string) (stop func()) {
+func startDescriptorRefresh(ctx context.Context, source descriptorSource, store *config.Store, gid string, generation uint64, stateDir, ingestURL string) (stop func()) {
 	ctx, cancel := context.WithCancel(ctx)
 	done := make(chan struct{})
 	go func() {
@@ -83,7 +90,7 @@ func startDescriptorRefresh(ctx context.Context, source descriptorSource, store 
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				if e := syncDescriptors(ctx, source, store, gid, generation, stateDir); e != nil {
+				if e := syncDescriptors(ctx, source, store, gid, generation, stateDir, ingestURL); e != nil {
 					if !failing {
 						logger.Warn("descriptors_unavailable", "problem", bounded(e.Error()), "hint", "The cloud could not deliver stream descriptors. Remote-write answers 503 with Retry-After until they arrive, so vmagent keeps the first batch in its WAL.")
 						failing = true
@@ -131,4 +138,29 @@ func saveDescriptorCache(path string, items []config.Binding) error {
 		return nil
 	}
 	return durable.Write(path, raw)
+}
+
+// describeDescriptors renders the cloud answer for verbose logs, keys included: the point of the event is to
+// show exactly which stream the gateway received.
+func describeDescriptors(items []uplink.Descriptor) []map[string]any {
+	out := make([]map[string]any, 0, len(items))
+	for _, d := range items {
+		out = append(out, map[string]any{
+			"id": d.ID, "streamKey": d.StreamKey, "sourceId": d.SourceID, "kind": d.Kind,
+			"metric": d.Metric, "selector": d.Selector, "scale": d.Scale,
+		})
+	}
+	return out
+}
+
+// activeBindings lists what the gateway is matching against right now, with each exact label map.
+func activeBindings(c *config.Config) []map[string]any {
+	out := make([]map[string]any, 0, len(c.Bindings))
+	for _, b := range c.Bindings {
+		out = append(out, map[string]any{
+			"id": b.ID, "kind": b.Kind, "sourceId": b.SourceID, "streamKey": b.StreamKey,
+			"selector": b.Selector, "scale": b.Scale, "principals": b.Principals,
+		})
+	}
+	return out
 }

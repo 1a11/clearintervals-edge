@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"github.com/1a11/clearintervals-edge/internal/auth"
 	"github.com/1a11/clearintervals-edge/internal/config"
+	"github.com/1a11/clearintervals-edge/internal/diag"
 	"net"
 	"net/http"
 	"os"
@@ -29,6 +30,7 @@ func New() *Gate { return &Gate{workers: make(chan struct{}, 2), failures: map[s
 func (m *Gate) Authenticate(r *http.Request, principals []config.Principal) (string, int) {
 	host, _, _ := net.SplitHostPort(r.RemoteAddr)
 	if !m.allowed(host, false) {
+		authenticated(r, principals, "", 429)
 		return "", 429
 	}
 	p := principal(r, principals)
@@ -36,6 +38,7 @@ func (m *Gate) Authenticate(r *http.Request, principals []config.Principal) (str
 		select {
 		case m.workers <- struct{}{}:
 		default:
+			authenticated(r, principals, p, 429)
 			return "", 429
 		}
 		for _, candidate := range principals {
@@ -48,9 +51,68 @@ func (m *Gate) Authenticate(r *http.Request, principals []config.Principal) (str
 	}
 	if p == "" {
 		m.allowed(host, true)
+		authenticated(r, principals, "", 401)
 		return "", 401
 	}
+	authenticated(r, principals, p, 0)
 	return p, 0
+}
+
+// authenticated writes the verbose authentication decision: the presented credential, the digests the gateway
+// computed, each configured principal's expected digest, and the outcome. Normal logs never carry these values.
+func authenticated(r *http.Request, principals []config.Principal, matched string, status int) {
+	if !diag.Enabled() {
+		return
+	}
+	authorization := r.Header.Get("Authorization")
+	_, _, basicOK := r.BasicAuth()
+	method := "none"
+	switch {
+	case strings.HasPrefix(authorization, "Bearer "):
+		method = "bearer"
+	case basicOK && strings.HasPrefix(strings.ToLower(authorization), "basic "):
+		method = "basic"
+	}
+	if r.TLS != nil && len(r.TLS.PeerCertificates) > 0 {
+		if method == "none" {
+			method = "certificate"
+		} else {
+			method += "+certificate"
+		}
+	}
+	var tokenHash, certHash [32]byte
+	hasToken := strings.HasPrefix(authorization, "Bearer ")
+	if hasToken {
+		tokenHash = sha256.Sum256([]byte(strings.TrimPrefix(authorization, "Bearer ")))
+	}
+	hasCert := r.TLS != nil && len(r.TLS.PeerCertificates) > 0
+	if hasCert {
+		certHash = sha256.Sum256(r.TLS.PeerCertificates[0].Raw)
+	}
+	comparisons := make([]map[string]any, 0, len(principals))
+	for _, p := range principals {
+		entry := map[string]any{"id": p.ID, "tokenSha256": p.TokenSHA256, "certificateSha256": p.CertificateSHA256, "passwordHashSet": p.PasswordHash != ""}
+		if hasToken && p.TokenSHA256 != "" {
+			expected, _ := hex.DecodeString(p.TokenSHA256)
+			entry["tokenMatch"] = subtle.ConstantTimeCompare(tokenHash[:], expected) == 1
+		}
+		if hasCert && p.CertificateSHA256 != "" {
+			expected, _ := hex.DecodeString(p.CertificateSHA256)
+			entry["certificateMatch"] = subtle.ConstantTimeCompare(certHash[:], expected) == 1
+		}
+		comparisons = append(comparisons, entry)
+	}
+	attrs := []any{
+		"remoteAddr", r.RemoteAddr, "method", method, "authorization", authorization,
+		"status", status, "matchedPrincipal", matched, "principals", comparisons,
+	}
+	if hasToken {
+		attrs = append(attrs, "bearerSha256", hex.EncodeToString(tokenHash[:]))
+	}
+	if hasCert {
+		attrs = append(attrs, "certificateSha256", hex.EncodeToString(certHash[:]))
+	}
+	diag.Event("verbose_writer_auth", attrs...)
 }
 func (m *Gate) allowed(host string, failed bool) bool {
 	m.mu.Lock()

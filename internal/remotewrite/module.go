@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"github.com/1a11/clearintervals-edge/internal/buffer"
 	"github.com/1a11/clearintervals-edge/internal/config"
+	"github.com/1a11/clearintervals-edge/internal/diag"
 	"github.com/1a11/clearintervals-edge/internal/httpauth"
 	"github.com/1a11/clearintervals-edge/internal/wire"
 	pb "github.com/1a11/clearintervals-edge/protocol/v1"
@@ -58,14 +59,39 @@ func fail(w http.ResponseWriter, status int) {
 	http.Error(w, http.StatusText(status), status)
 }
 func (m *Module) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	c := m.Config.Get()
+	if diag.Enabled() {
+		diag.Event("verbose_remotewrite_request",
+			"remoteAddr", r.RemoteAddr, "method", r.Method, "uri", r.RequestURI, "proto", r.Proto,
+			"path", r.URL.Path, "query", r.URL.RawQuery, "headers", headerMap(r),
+			"contentType", r.Header.Get("Content-Type"), "contentEncoding", r.Header.Get("Content-Encoding"),
+			"remoteWriteVersion", r.Header.Get("X-Prometheus-Remote-Write-Version"), "contentLength", r.ContentLength,
+			"authorization", r.Header.Get("Authorization"),
+			"bearerSha256", bearerDigest(r),
+			"principals", authComparisons(c.Modules.RemoteWrite.Principals, r))
+	}
+	// reject records why a POST is about to be refused before the caller sees only a status code.
+	reject := func(status int, stage string, extra ...any) {
+		diag.Event("verbose_remotewrite_rejected", append([]any{"status", status, "stage", stage,
+			"remoteAddr", r.RemoteAddr, "authorization", r.Header.Get("Authorization")}, extra...)...)
+		fail(w, status)
+	}
 	if r.Method != http.MethodPost || r.URL.Path != "/api/v1/write" || r.URL.RawQuery != "" {
-		fail(w, 404)
+		reject(404, "method_or_path")
 		return
 	}
-	c := m.Config.Get()
 	p, status := m.auth.Authenticate(r, c.Modules.RemoteWrite.Principals)
+	if diag.Enabled() {
+		reason := "accepted"
+		if status != 0 {
+			reason = authReason(r)
+		}
+		diag.Event("verbose_remotewrite_auth", "remoteAddr", r.RemoteAddr, "status", status, "principal", p,
+			"authorization", r.Header.Get("Authorization"), "bearerSha256", bearerDigest(r), "basicUser", basicUser(r),
+			"principals", authComparisons(c.Modules.RemoteWrite.Principals, r), "reason", reason)
+	}
 	if status != 0 {
-		fail(w, status)
+		reject(status, "authentication")
 		return
 	}
 
@@ -73,15 +99,15 @@ func (m *Module) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case m.slots <- struct{}{}:
 		defer func() { <-m.slots }()
 	default:
-		fail(w, 429)
+		reject(429, "busy")
 		return
 	}
 	if r.Header.Get("Content-Type") != "application/x-protobuf" || r.Header.Get("X-Prometheus-Remote-Write-Version") != "0.1.0" {
-		fail(w, 415)
+		reject(415, "unsupported_format")
 		return
 	}
 	if r.ContentLength > MaxCompressed {
-		fail(w, 413)
+		reject(413, "content_length", "limit", MaxCompressed)
 		return
 	}
 	ctl := http.NewResponseController(w)
@@ -89,23 +115,36 @@ func (m *Module) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	_ = ctl.SetWriteDeadline(time.Now().Add(30 * time.Second))
 	compressed, e := io.ReadAll(io.LimitReader(&progressReader{reader: r.Body, controller: ctl, deadline: time.Now().Add(30 * time.Second)}, MaxCompressed+1))
 	if e != nil {
-		fail(w, 400)
+		diag.Event("verbose_remotewrite_payload", "stage", "read", "encoding", r.Header.Get("Content-Encoding"), "error", e.Error())
+		reject(400, "body_read", "error", e.Error())
 		return
 	}
 	if len(compressed) > MaxCompressed {
-		fail(w, 413)
+		diag.Event("verbose_remotewrite_payload", "stage", "size", "compressedBytes", len(compressed), "limit", MaxCompressed)
+		reject(413, "compressed_size", "limit", MaxCompressed, "received", len(compressed))
 		return
 	}
 	raw, e := decode(compressed, r.Header.Get("Content-Encoding"))
 	if e != nil {
-		fail(w, 400)
+		diag.Event("verbose_remotewrite_payload", "stage", "decompress", "compressedBytes", len(compressed),
+			"encoding", r.Header.Get("Content-Encoding"), "error", e.Error())
+		reject(400, "decompression", "encoding", r.Header.Get("Content-Encoding"), "error", e.Error())
 		return
 	}
 	data, e := parse(raw)
 	if e != nil {
-		fail(w, 400)
+		diag.Event("verbose_remotewrite_payload", "stage", "parse", "compressedBytes", len(compressed),
+			"decompressedBytes", len(raw), "encoding", r.Header.Get("Content-Encoding"), "error", e.Error())
+		reject(400, "protobuf_parse", "decodedBytes", len(raw), "error", e.Error())
 		return
 	}
+	totalSamples := 0
+	for _, v := range data {
+		totalSamples += len(v.samples)
+	}
+	diag.Event("verbose_remotewrite_payload", "stage", "decoded", "compressedBytes", len(compressed),
+		"encoding", r.Header.Get("Content-Encoding"), "decompressedBytes", len(raw),
+		"decodedSeriesCount", len(data), "totalSamples", totalSamples)
 	items := []*pb.Item{}
 	unmapped := uint64(0)
 	old := uint64(0)
@@ -129,7 +168,10 @@ func (m *Module) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if len(matches) > 1 {
-			fail(w, 400)
+			diag.Event("verbose_remotewrite_series", "receivedLabels", s.labels, "labels", s.labels,
+				"sampleCount", len(s.samples), "samples", sampleValues(s.samples), "outcome", "rejected",
+				"status", 400, "reason", "more than one binding matches these labels", "bindingIds", bindingIDs(matches))
+			reject(400, "ambiguous_selector", "receivedLabels", s.labels, "bindingIds", bindingIDs(matches))
 			return
 		}
 		if len(matches) == 0 {
@@ -137,18 +179,30 @@ func (m *Module) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				// The cloud has not named the streams yet. Answering 503 keeps
 				// the first batch in vmagent's WAL; dropping it as unmapped
 				// before the initial descriptor sync would lose those samples.
+				diag.Event("verbose_remotewrite_series", "receivedLabels", s.labels, "labels", s.labels,
+					"sampleCount", len(s.samples), "samples", sampleValues(s.samples),
+					"outcome", "held_503_awaiting_descriptors", "bindingDiffs", bindingDiffs(c.Bindings, s.labels))
 				w.Header().Set("Retry-After", "15")
-				fail(w, http.StatusServiceUnavailable)
+				reject(503, "descriptors_pending", "receivedLabels", s.labels)
 				return
 			}
+			diag.Event("verbose_remotewrite_series", "receivedLabels", s.labels, "labels", s.labels,
+				"sampleCount", len(s.samples), "samples", sampleValues(s.samples), "outcome", "unmapped",
+				"bindingDiffs", bindingDiffs(c.Bindings, s.labels))
 			unmapped += uint64(len(s.samples))
 			continue
 		}
 		b := matches[0]
 		if !slices.Contains(b.Principals, p) {
-			fail(w, 403)
+			diag.Event("verbose_remotewrite_series", "receivedLabels", s.labels, "labels", s.labels,
+				"sampleCount", len(s.samples), "samples", sampleValues(s.samples), "outcome", "rejected",
+				"status", 403, "reason", "the authenticated principal is not allowed on the matched binding",
+				"bindingId", b.ID, "principal", p, "allowedPrincipals", b.Principals)
+			reject(403, "principal_not_on_binding", "principal", p, "bindingId", b.ID,
+				"allowedPrincipals", b.Principals, "receivedLabels", s.labels)
 			return
 		}
+		accepted := make([]map[string]any, 0, len(s.samples))
 		for _, v := range s.samples {
 			at := time.UnixMilli(v.at).UTC()
 			if now.Sub(at) > c.MaxAge() {
@@ -156,20 +210,34 @@ func (m *Module) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			if at.After(now.Add(5 * time.Minute)) {
-				fail(w, 400)
+				diag.Event("verbose_remotewrite_series", "receivedLabels", s.labels, "labels", s.labels,
+					"sampleCount", len(s.samples), "samples", sampleValues(s.samples), "outcome", "rejected",
+					"status", 400, "reason", "sample timestamp is more than 5 minutes in the future",
+					"timestamp", at.Format(time.RFC3339Nano), "bindingId", b.ID)
+				reject(400, "timestamp_in_future", "timestamp", at.Format(time.RFC3339Nano),
+					"bindingId", b.ID, "receivedLabels", s.labels)
 				return
 			}
 			value := v.value * b.Scale
 			if math.IsNaN(value) || math.IsInf(value, 0) || value == 0 && math.Signbit(value) {
-				fail(w, 400)
+				diag.Event("verbose_remotewrite_series", "receivedLabels", s.labels, "labels", s.labels,
+					"sampleCount", len(s.samples), "samples", sampleValues(s.samples), "outcome", "rejected",
+					"status", 400, "reason", "scaled sample value is not finite or is negative zero",
+					"value", v.value, "scaledValue", value, "bindingId", b.ID, "scale", b.Scale)
+				reject(400, "invalid_value", "value", v.value, "scaledValue", value,
+					"bindingId", b.ID, "receivedLabels", s.labels)
 				return
 			}
 			timestamp := at.Format(time.RFC3339Nano)
+			accepted = append(accepted, map[string]any{"timestamp": timestamp, "value": v.value, "scaledValue": value})
 			id := sha256.Sum256([]byte(b.SourceID + "\x00" + timestamp))
 			i := &pb.Item{Id: hex.EncodeToString(id[:]), StreamKey: b.StreamKey, BindingId: b.ID, SourceId: b.SourceID, Body: &pb.Item_Point{Point: &pb.Point{Timestamp: timestamp, Value: value}}}
 			i.Hash, _ = wire.Hash(i)
 			items = append(items, i)
 		}
+		diag.Event("verbose_remotewrite_series", "receivedLabels", s.labels, "labels", s.labels,
+			"sampleCount", len(s.samples), "samples", accepted, "outcome", "matched", "bindingId", b.ID,
+			"sourceId", b.SourceID, "streamKey", b.StreamKey, "selector", b.Selector, "scale", b.Scale)
 	}
 	e = m.Config.Admit(c, func() error {
 		if unmapped > 0 {
@@ -185,7 +253,7 @@ func (m *Module) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return m.Queue.Enqueue(items, now)
 	})
 	if e != nil {
-		fail(w, 503)
+		reject(503, "admission", "error", e.Error(), "items", len(items))
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)

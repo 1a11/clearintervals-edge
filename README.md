@@ -169,6 +169,31 @@ The gateway writes JSON lines to `stdout`. Every log line includes `event`; erro
 | Writer receives `401` or `403` | Invalid token, or the writer principal is not listed on the matched binding. |
 | `buffer_integrity_alarm` | Disk error or corrupt segment. Inspect the disk; corrupt segments move to `.bad`. |
 
+## Verbose debugging
+
+Normal logs are bounded and redacted. When a writer reaches the gateway but its samples do not appear in Clear Intervals, verbose mode shows every step: the listener connection, the TLS handshake, the request, the payload, each series with its labels, the match against a binding or a cloud descriptor, the buffered item, the uplink frames and the cloud's per-item answer.
+
+Turn it on in any of three ways:
+
+- CLI: `edgegateway -config /etc/edgegateway/config.yaml -verbose`
+- Container environment: `-e EDGE_VERBOSE=1` (or `true`) in `docker run`, or `environment: [EDGE_VERBOSE=1]` in `docker-compose.yml`
+- Configuration: `verbose: true` in `config.yaml`, then restart the gateway
+
+| Event | What it shows |
+| --- | --- |
+| `verbose_config_loaded` | The whole effective configuration: paths, listeners, writer principals with their `tokenSha256`, uplink settings and static bindings. |
+| `verbose_listener_conn`, `verbose_listener_error` | Raw writer connections (`accepted`, `active`, `closed`, peer address) and the HTTP or TLS handshake error the normal server log discards, for example a writer with the wrong CA. |
+| `verbose_remotewrite_request`, `verbose_remotewrite_auth` | Every POST: URI, protocol, full headers including `Authorization`, and the bearer digest compared with each principal's `tokenSha256`. |
+| `verbose_remotewrite_payload` | Compressed and decoded byte counts, series and sample counts, or the exact read, decompression or protobuf error. |
+| `verbose_remotewrite_series`, `verbose_remotewrite_rejected` | Each series with all labels and samples: matched (`bindingId`, `sourceId`, `streamKey`, scaled value), unmapped with a per-binding label diff, held at `503` until descriptors arrive, or rejected with the status and reason. |
+| `verbose_descriptor_poll`, `verbose_descriptor_response`, `verbose_active_selectors` | The descriptor request, the cloud's full answer or error, and every selector the gateway matches against. |
+| `verbose_uplink_dial` | The QUIC `h3` attempt and the TCP `h2` fallback or proxy `CONNECT`, with the TLS version, ALPN and the server certificate subject and SHA-256. |
+| `verbose_uplink_welcome`, `verbose_uplink_heartbeat` | Session open (session id, transport, capabilities, clock offset) and each heartbeat with buffer and counter totals. |
+| `verbose_uplink_frame_send`, `verbose_uplink_frame_recv` | Every uplink frame: path, frame type, item count, and the cloud's failure code, reason and reference. |
+| `verbose_uplink_batch_send`, `verbose_uplink_batch_ack` | The items sent (id, binding, source, stream key, timestamp, value) and the cloud's per-item outcome, code and retry time. |
+
+Verbose output is deliberately unredacted. It writes bearer tokens, Argon2id hashes, stream keys, labels, sample values and certificates. Enable it for a short session, keep the output on the gateway host or a private log store, and turn it off afterwards.
+
 ## Building from source
 
 ```sh

@@ -5,6 +5,9 @@
 stateDir: /var/lib/edgegateway
 deploymentLicensePath: /var/lib/edgegateway/enrollment/license.json
 statusListen: 127.0.0.1:9081
+# verbose: true writes detailed, unredacted diagnostics (tokens, stream keys, labels, sample values).
+# It is for debugging a writer or the uplink; keep it off in production.
+verbose: false
 buffer:
   maxBytes: 10737418240
   maxAgeDays: 7
