@@ -20,6 +20,12 @@ modules:
     key: ""
     writerCa: ""
     principals: []
+    # One vmagent block bounded by samples, compressed body and decoded body. Raise maxSamples and maxBodyBytes
+    # for a cluster with tens of thousands of series. Environment overrides:
+    # EDGE_REMOTEWRITE_MAX_SAMPLES, EDGE_REMOTEWRITE_MAX_BODY_BYTES, EDGE_REMOTEWRITE_MAX_DECODED_BYTES.
+    maxSamples: 250000
+    maxBodyBytes: 16777216
+    maxDecodedBytes: 67108864
   captures:
     enabled: false
     listen: 127.0.0.1:8430

@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+	"fmt"
 	"github.com/1a11/clearintervals-edge/internal/auth"
 	"github.com/1a11/clearintervals-edge/internal/buffer"
 	"github.com/1a11/clearintervals-edge/internal/config"
@@ -117,13 +118,18 @@ func TestEmptySelectorValueStillRequiresLabelPresence(t *testing.T) {
 }
 func TestMalformedAndCompressedBombs(t *testing.T) {
 	m, _ := module(t)
-	for _, raw := range [][]byte{{255, 255, 255}, snappy.Encode(nil, bytes.Repeat([]byte{0}, MaxDecoded+1)), snappy.Encode(nil, request(math.Inf(1), time.Now().UnixMilli())), snappy.Encode(nil, field(1, field(1, field(1, bytes.Repeat([]byte("x"), 129)))))} {
+	// A non-finite sample is data, not framing: it is discarded sample by sample in ServeHTTP, not here.
+	for _, raw := range [][]byte{{255, 255, 255}, snappy.Encode(nil, bytes.Repeat([]byte{0}, DefaultMaxDecodedBytes+1)), snappy.Encode(nil, field(1, field(1, field(1, bytes.Repeat([]byte("x"), 129)))))} {
 		if w := submit(m, raw, testToken, "snappy"); w.Code != 400 {
 			t.Fatal("invalid request accepted", w.Code)
 		}
 	}
-	if _, e := parse(bytes.Repeat([]byte{0x0a, 0}, 1001)); e == nil {
-		t.Fatal("unbounded series")
+	over := make([][]byte, 0, DefaultMaxSamples+1)
+	for i := 0; i <= DefaultMaxSamples; i++ {
+		over = append(over, timeSeries(map[string]string{"__name__": "metric"}, 1, 0))
+	}
+	if _, e := parse(bytes.Join(over, nil), DefaultMaxSamples); e == nil {
+		t.Fatal("series cap not enforced")
 	}
 }
 func TestUnmappedSuspensionAndDiskFailure(t *testing.T) {
@@ -146,23 +152,124 @@ func TestUnmappedSuspensionAndDiskFailure(t *testing.T) {
 	if s.Drops["suspended"] != 1 {
 		t.Fatal(s)
 	}
+	// A negative scale turning 0 into -0.0 is normalised, not refused: one bad sample must not drop a block.
 	m, q = module(t)
 	m.Config.Get().Bindings[0].Scale = -1
 	raw = snappy.Encode(nil, request(0, time.Now().UnixMilli()))
-	if w := submit(m, raw, testToken, "snappy"); w.Code != 400 {
-		t.Fatal("negative zero accepted")
+	if w := submit(m, raw, testToken, "snappy"); w.Code != 204 {
+		t.Fatalf("negative zero reply: %d", w.Code)
 	}
+	v, e := q.Next(time.Now())
+	if e != nil || len(v) != 1 || v[0].Item.GetPoint().Value != 0 || math.Signbit(v[0].Item.GetPoint().Value) {
+		t.Fatalf("negative zero normalisation: %v %v", v, e)
+	}
+}
+
+// A Kubernetes batch from vmagent is one block with thousands of series, almost all of them unmapped here. A
+// stale NaN marker, an Inf sample or the sheer count must not turn the block into a 400 that vmagent drops.
+func TestLargeBatchWithUnmappedAndNonFiniteSamplesIsAccepted(t *testing.T) {
+	m, q := module(t)
+	at := time.Now().UnixMilli()
+	batch := make([][]byte, 0, 2500)
+	for i := 0; i < 2499; i++ {
+		value := 1.0
+		if i == 0 {
+			value = math.NaN() // Prometheus StaleNaN after a target disappears
+		}
+		batch = append(batch, timeSeries(map[string]string{
+			"__name__": "kube_pod_info", "namespace": "default", "pod": fmt.Sprintf("pod-%d", i),
+		}, value, at))
+	}
+	batch = append(batch, timeSeries(map[string]string{"__name__": "rpm"}, 1480, at))
+	if w := submit(m, snappy.Encode(nil, bytes.Join(batch, nil)), testToken, "snappy"); w.Code != 204 {
+		t.Fatalf("large batch refused: %d %s", w.Code, w.Body.String())
+	}
+	v, e := q.Next(time.Now())
+	if e != nil || len(v) != 1 || v[0].Item.GetPoint().Value != 1480 {
+		t.Fatalf("matched sample not queued: %v %v", v, e)
+	}
+	stats, _, _ := q.Snapshot()
+	if stats.Drops["unmapped"] != 2499 {
+		t.Fatalf("unmapped accounting: %v", stats.Drops)
+	}
+}
+
+// More than one queue transaction's worth of matched samples is committed in chunks instead of being refused.
+func TestMatchedBatchOverTheQueueChunkIsAccepted(t *testing.T) {
+	m, q := module(t)
+	at := time.Now().UnixMilli()
+	batch := make([][]byte, 0, 1501)
+	for i := 0; i < 1501; i++ {
+		batch = append(batch, timeSeries(map[string]string{"__name__": "rpm", "instance": fmt.Sprintf("i-%d", i)}, float64(i), at))
+	}
+	if w := submit(m, snappy.Encode(nil, bytes.Join(batch, nil)), testToken, "snappy"); w.Code != 204 {
+		t.Fatalf("chunked batch refused: %d", w.Code)
+	}
+	// 1,501 matched items exceed one queue transaction (wire.MaxItems = 1,000), so they are committed as two
+	// segments. Queue entries are not drained here: without an ack the same segment stays readable.
+	if _, size, segments := q.Snapshot(); segments != 2 || size == 0 {
+		t.Fatalf("segments %d, size %d, want 2 non-empty segments", segments, size)
+	}
+}
+
+// A block whose repeated label names and values compress far better than 20:1 is still a normal block.
+func TestHighlyCompressedBlockIsDecoded(t *testing.T) {
+	raw := bytes.Repeat([]byte{0}, 4<<20)
+	compressed := snappy.Encode(nil, raw)
+	if len(compressed)*20 >= len(raw) {
+		t.Skip("snappy did not reach a ratio above 20 for this payload")
+	}
+	decoded, e := decode(compressed, "snappy", DefaultMaxDecodedBytes)
+	if e != nil || len(decoded) != len(raw) {
+		t.Fatalf("highly compressed block refused: %v", e)
+	}
+}
+
+// vmagent adds fields this sink does not read (WriteRequest.metadata, TimeSeries.exemplars and histograms). They
+// must be skipped, not turned into a 400 that loses the whole block.
+func TestUnknownProtobufFieldsAreSkipped(t *testing.T) {
+	m, q := module(t)
+	at := time.Now().UnixMilli()
+	label := append(field(1, []byte("__name__")), field(2, []byte("rpm"))...)
+	var f [8]byte
+	binary.LittleEndian.PutUint64(f[:], math.Float64bits(1480))
+	sample := append(protowire.AppendTag(nil, 1, protowire.Fixed64Type), f[:]...)
+	sample = protowire.AppendVarint(protowire.AppendTag(sample, 2, protowire.VarintType), uint64(at))
+	series := append(field(1, label), field(2, sample)...)
+	series = append(series, field(3, []byte("exemplar"))...)  // TimeSeries.exemplars
+	series = append(series, field(4, []byte("histogram"))...) // TimeSeries.histograms
+	raw := append(field(1, series), field(3, []byte("metadata"))...)
+	if w := submit(m, snappy.Encode(nil, raw), testToken, "snappy"); w.Code != 204 {
+		t.Fatalf("unknown fields refused: %d %s", w.Code, w.Body.String())
+	}
+	if v, e := q.Next(time.Now()); e != nil || len(v) != 1 || v[0].Item.GetPoint().Value != 1480 {
+		t.Fatalf("point not queued: %v %v", v, e)
+	}
+}
+
+// timeSeries builds one TimeSeries with any label set, for batches that look like vmagent's.
+func timeSeries(labels map[string]string, value float64, timestamp int64) []byte {
+	body := []byte{}
+	for name, val := range labels {
+		label := append(field(1, []byte(name)), field(2, []byte(val))...)
+		body = append(body, field(1, label)...)
+	}
+	var f [8]byte
+	binary.LittleEndian.PutUint64(f[:], math.Float64bits(value))
+	sample := append(protowire.AppendTag(nil, 1, protowire.Fixed64Type), f[:]...)
+	sample = protowire.AppendVarint(protowire.AppendTag(sample, 2, protowire.VarintType), uint64(timestamp))
+	return field(1, append(body, field(2, sample)...))
 }
 func FuzzRemoteWrite(f *testing.F) {
 	f.Add(request(1480, time.Now().UnixMilli()))
 	f.Add([]byte{255, 255})
 	f.Fuzz(func(t *testing.T, raw []byte) {
-		if len(raw) > MaxCompressed {
+		if len(raw) > DefaultMaxBodyBytes {
 			return
 		}
-		_, _ = parse(raw)
-		_, _ = decode(raw, "snappy")
-		_, _ = decode(raw, "zstd")
+		_, _ = parse(raw, DefaultMaxSamples)
+		_, _ = decode(raw, "snappy", DefaultMaxDecodedBytes)
+		_, _ = decode(raw, "zstd", DefaultMaxDecodedBytes)
 	})
 }
 func TestBasicAuthAndBoundedPasswordWorkers(t *testing.T) {

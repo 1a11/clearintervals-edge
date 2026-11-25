@@ -236,3 +236,57 @@ func TestVerboseFromFileAndEnvironment(t *testing.T) {
 		t.Fatalf("EDGE_VERBOSE=0 did not override verbose: true: %v %v", loaded, e)
 	}
 }
+
+// The remote-write request limits follow the file, then the environment, then the defaults, and a reload may
+// change them without a restart.
+func TestRemoteWriteLimitsDefaultsOverridesAndReload(t *testing.T) {
+	base := func() *Config {
+		c := valid(t)
+		c.Buffer.MaxAgeDays = 7
+		c.Buffer.MaxBytes = 1 << 20
+		c.Buffer.MaxSegments = 100
+		return c
+	}
+	loaded, e := load(t, base())
+	if e != nil {
+		t.Fatal(e)
+	}
+	l := loaded.Modules.RemoteWrite
+	if l.MaxSamples != 250000 || l.MaxBodyBytes != 16<<20 || l.MaxDecodedBytes != 64<<20 {
+		t.Fatalf("defaults: %d %d %d", l.MaxSamples, l.MaxBodyBytes, l.MaxDecodedBytes)
+	}
+
+	t.Setenv("EDGE_REMOTEWRITE_MAX_SAMPLES", "400000")
+	t.Setenv("EDGE_REMOTEWRITE_MAX_BODY_BYTES", "33554432")
+	t.Setenv("EDGE_REMOTEWRITE_MAX_DECODED_BYTES", "134217728")
+	if loaded, e = load(t, base()); e != nil {
+		t.Fatal(e)
+	}
+	l = loaded.Modules.RemoteWrite
+	if l.MaxSamples != 400000 || l.MaxBodyBytes != 33554432 || l.MaxDecodedBytes != 134217728 {
+		t.Fatalf("environment overrides: %d %d %d", l.MaxSamples, l.MaxBodyBytes, l.MaxDecodedBytes)
+	}
+
+	t.Setenv("EDGE_REMOTEWRITE_MAX_SAMPLES", "10000001")
+	if _, e = load(t, base()); e == nil {
+		t.Fatal("maxSamples above the bound accepted")
+	}
+	t.Setenv("EDGE_REMOTEWRITE_MAX_SAMPLES", "")
+	c := base()
+	c.Modules.RemoteWrite.MaxSamples = -1
+	if _, e = load(t, c); e == nil {
+		t.Fatal("negative maxSamples accepted")
+	}
+
+	t.Setenv("EDGE_REMOTEWRITE_MAX_SAMPLES", "400000")
+	store := New(loaded)
+	next := *loaded
+	next.Modules.RemoteWrite.MaxSamples = 500000
+	next.Modules.RemoteWrite.MaxDecodedBytes = 128 << 20
+	if e = store.Reload(&next); e != nil {
+		t.Fatalf("reload refused a limit change: %v", e)
+	}
+	if store.Get().Modules.RemoteWrite.MaxSamples != 500000 {
+		t.Fatal("reload did not apply the new limit")
+	}
+}

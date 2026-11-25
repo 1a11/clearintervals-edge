@@ -20,12 +20,35 @@ import (
 	"math"
 	"net/http"
 	"slices"
+	"sort"
 	"time"
 	"unicode/utf8"
 )
 
-const MaxCompressed = 4 << 20
-const MaxDecoded = 16 << 20
+// Defaults for modules.remoteWrite limits when the configuration leaves them unset. vmagent sends up to 10,000
+// rows per block, and a cluster with tens of thousands of series needs a larger request, so the limits are
+// configurable (maxSamples, maxBodyBytes, maxDecodedBytes) and these are only the fallbacks.
+const (
+	DefaultMaxSamples      = 250000
+	DefaultMaxBodyBytes    = 16 << 20
+	DefaultMaxDecodedBytes = 64 << 20
+)
+
+// requestLimits returns the effective bounds of one remote-write request.
+func requestLimits(c *config.Config) (maxSamples, maxCompressed, maxDecoded int) {
+	l := c.Modules.RemoteWrite
+	maxSamples, maxCompressed, maxDecoded = l.MaxSamples, int(l.MaxBodyBytes), int(l.MaxDecodedBytes)
+	if maxSamples <= 0 {
+		maxSamples = DefaultMaxSamples
+	}
+	if maxCompressed <= 0 {
+		maxCompressed = DefaultMaxBodyBytes
+	}
+	if maxDecoded <= 0 {
+		maxDecoded = DefaultMaxDecodedBytes
+	}
+	return maxSamples, maxCompressed, maxDecoded
+}
 
 type sample struct {
 	at    int64
@@ -60,6 +83,7 @@ func fail(w http.ResponseWriter, status int) {
 }
 func (m *Module) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	c := m.Config.Get()
+	maxSamples, maxCompressed, maxDecoded := requestLimits(c)
 	if diag.Enabled() {
 		diag.Event("verbose_remotewrite_request",
 			"remoteAddr", r.RemoteAddr, "method", r.Method, "uri", r.RequestURI, "proto", r.Proto,
@@ -106,32 +130,32 @@ func (m *Module) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		reject(415, "unsupported_format")
 		return
 	}
-	if r.ContentLength > MaxCompressed {
-		reject(413, "content_length", "limit", MaxCompressed)
+	if r.ContentLength > int64(maxCompressed) {
+		reject(413, "content_length", "limit", maxCompressed)
 		return
 	}
 	ctl := http.NewResponseController(w)
 	_ = ctl.SetReadDeadline(time.Now().Add(30 * time.Second))
 	_ = ctl.SetWriteDeadline(time.Now().Add(30 * time.Second))
-	compressed, e := io.ReadAll(io.LimitReader(&progressReader{reader: r.Body, controller: ctl, deadline: time.Now().Add(30 * time.Second)}, MaxCompressed+1))
+	compressed, e := io.ReadAll(io.LimitReader(&progressReader{reader: r.Body, controller: ctl, deadline: time.Now().Add(30 * time.Second)}, int64(maxCompressed)+1))
 	if e != nil {
 		diag.Event("verbose_remotewrite_payload", "stage", "read", "encoding", r.Header.Get("Content-Encoding"), "error", e.Error())
 		reject(400, "body_read", "error", e.Error())
 		return
 	}
-	if len(compressed) > MaxCompressed {
-		diag.Event("verbose_remotewrite_payload", "stage", "size", "compressedBytes", len(compressed), "limit", MaxCompressed)
-		reject(413, "compressed_size", "limit", MaxCompressed, "received", len(compressed))
+	if len(compressed) > maxCompressed {
+		diag.Event("verbose_remotewrite_payload", "stage", "size", "compressedBytes", len(compressed), "limit", maxCompressed)
+		reject(413, "compressed_size", "limit", maxCompressed, "received", len(compressed))
 		return
 	}
-	raw, e := decode(compressed, r.Header.Get("Content-Encoding"))
+	raw, e := decode(compressed, r.Header.Get("Content-Encoding"), maxDecoded)
 	if e != nil {
 		diag.Event("verbose_remotewrite_payload", "stage", "decompress", "compressedBytes", len(compressed),
 			"encoding", r.Header.Get("Content-Encoding"), "error", e.Error())
 		reject(400, "decompression", "encoding", r.Header.Get("Content-Encoding"), "error", e.Error())
 		return
 	}
-	data, e := parse(raw)
+	data, e := parse(raw, maxSamples)
 	if e != nil {
 		diag.Event("verbose_remotewrite_payload", "stage", "parse", "compressedBytes", len(compressed),
 			"decompressedBytes", len(raw), "encoding", r.Header.Get("Content-Encoding"), "error", e.Error())
@@ -149,6 +173,17 @@ func (m *Module) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	unmapped := uint64(0)
 	old := uint64(0)
 	now := time.Now()
+	// A cluster block carries tens of thousands of unmapped series. Logging each one would flood stdout, so
+	// only the first few and any near-miss on a configured metric are logged in full; the rest are summarized.
+	const unmappedFullLimit = 20
+	watchedMetrics := map[string]bool{}
+	for _, b := range c.Bindings {
+		if name := b.Selector["__name__"]; name != "" {
+			watchedMetrics[name] = true
+		}
+	}
+	unmappedSeriesTotal, unmappedSamplesTotal, unmappedLogged := 0, 0, 0
+	unmappedMetricNames := map[string]bool{}
 	for _, s := range data {
 		matches := []config.Binding{}
 		for _, b := range c.Bindings {
@@ -186,9 +221,18 @@ func (m *Module) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				reject(503, "descriptors_pending", "receivedLabels", s.labels)
 				return
 			}
-			diag.Event("verbose_remotewrite_series", "receivedLabels", s.labels, "labels", s.labels,
-				"sampleCount", len(s.samples), "samples", sampleValues(s.samples), "outcome", "unmapped",
-				"bindingDiffs", bindingDiffs(c.Bindings, s.labels))
+			unmappedSeriesTotal++
+			unmappedSamplesTotal += len(s.samples)
+			metric := s.labels["__name__"]
+			if metric != "" && len(unmappedMetricNames) < 50 {
+				unmappedMetricNames[metric] = true
+			}
+			if unmappedLogged < unmappedFullLimit || watchedMetrics[metric] {
+				unmappedLogged++
+				diag.Event("verbose_remotewrite_series", "receivedLabels", s.labels, "labels", s.labels,
+					"sampleCount", len(s.samples), "samples", sampleValues(s.samples), "outcome", "unmapped",
+					"bindingDiffs", bindingDiffs(c.Bindings, s.labels))
+			}
 			unmapped += uint64(len(s.samples))
 			continue
 		}
@@ -203,6 +247,7 @@ func (m *Module) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		accepted := make([]map[string]any, 0, len(s.samples))
+		skipped := 0
 		for _, v := range s.samples {
 			at := time.UnixMilli(v.at).UTC()
 			if now.Sub(at) > c.MaxAge() {
@@ -218,15 +263,15 @@ func (m *Module) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					"bindingId", b.ID, "receivedLabels", s.labels)
 				return
 			}
+			if math.IsNaN(v.value) || math.IsInf(v.value, 0) {
+				// A stale marker or an Inf sample is discarded alone; the rest of the request still commits.
+				unmapped++
+				skipped++
+				continue
+			}
 			value := v.value * b.Scale
-			if math.IsNaN(value) || math.IsInf(value, 0) || value == 0 && math.Signbit(value) {
-				diag.Event("verbose_remotewrite_series", "receivedLabels", s.labels, "labels", s.labels,
-					"sampleCount", len(s.samples), "samples", sampleValues(s.samples), "outcome", "rejected",
-					"status", 400, "reason", "scaled sample value is not finite or is negative zero",
-					"value", v.value, "scaledValue", value, "bindingId", b.ID, "scale", b.Scale)
-				reject(400, "invalid_value", "value", v.value, "scaledValue", value,
-					"bindingId", b.ID, "receivedLabels", s.labels)
-				return
+			if value == 0 {
+				value = 0 // normalise -0.0 so the wire never carries negative zero
 			}
 			timestamp := at.Format(time.RFC3339Nano)
 			accepted = append(accepted, map[string]any{"timestamp": timestamp, "value": v.value, "scaledValue": value})
@@ -236,8 +281,17 @@ func (m *Module) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			items = append(items, i)
 		}
 		diag.Event("verbose_remotewrite_series", "receivedLabels", s.labels, "labels", s.labels,
-			"sampleCount", len(s.samples), "samples", accepted, "outcome", "matched", "bindingId", b.ID,
-			"sourceId", b.SourceID, "streamKey", b.StreamKey, "selector", b.Selector, "scale", b.Scale)
+			"sampleCount", len(s.samples), "samples", accepted, "skippedSamples", skipped, "outcome", "matched",
+			"bindingId", b.ID, "sourceId", b.SourceID, "streamKey", b.StreamKey, "selector", b.Selector, "scale", b.Scale)
+	}
+	if unmappedSeriesTotal > unmappedLogged {
+		names := make([]string, 0, len(unmappedMetricNames))
+		for name := range unmappedMetricNames {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		diag.Event("verbose_remotewrite_unmapped_summary", "totalUnmappedSeries", unmappedSeriesTotal,
+			"totalUnmappedSamples", unmappedSamplesTotal, "loggedInFull", unmappedLogged, "sampleMetricNames", names)
 	}
 	e = m.Config.Admit(c, func() error {
 		if unmapped > 0 {
@@ -250,7 +304,14 @@ func (m *Module) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				return e
 			}
 		}
-		return m.Queue.Enqueue(items, now)
+		// A request carries several thousand series; the queue commits at most wire.MaxItems per transaction.
+		for i := 0; i < len(items); i += wire.MaxItems {
+			end := min(i+wire.MaxItems, len(items))
+			if e = m.Queue.Enqueue(items[i:end], now); e != nil {
+				return e
+			}
+		}
+		return nil
 	})
 	if e != nil {
 		reject(503, "admission", "error", e.Error(), "items", len(items))
@@ -275,23 +336,26 @@ func minTime(a, b time.Time) time.Time {
 	}
 	return b
 }
-func decode(b []byte, encoding string) ([]byte, error) {
+
+// decode decompresses one request. The decoded size is bounded by maxDecoded alone: a cluster block with many
+// repeated label names and values compresses far better than the old 20:1 ratio guess, and refusing it by ratio
+// made vmagent drop the whole block.
+func decode(b []byte, encoding string, maxDecoded int) ([]byte, error) {
 	switch encoding {
 	case "snappy":
 		n, e := snappy.DecodedLen(b)
-		if e != nil || n > MaxDecoded || n > 20*len(b) {
+		if e != nil || n > maxDecoded {
 			return nil, wire.ErrFrame
 		}
 		return snappy.Decode(make([]byte, 0, n), b)
 	case "zstd":
-		d, e := zstd.NewReader(bytes.NewReader(b), zstd.WithDecoderConcurrency(1), zstd.WithDecoderMaxMemory(MaxDecoded), zstd.WithDecoderMaxWindow(MaxDecoded))
+		d, e := zstd.NewReader(bytes.NewReader(b), zstd.WithDecoderConcurrency(1), zstd.WithDecoderMaxMemory(uint64(maxDecoded)), zstd.WithDecoderMaxWindow(uint64(maxDecoded)))
 		if e != nil {
 			return nil, e
 		}
 		defer d.Close()
-		limit := min(MaxDecoded, 20*len(b))
-		raw, e := io.ReadAll(io.LimitReader(d, int64(limit)+1))
-		if e != nil || len(raw) > limit {
+		raw, e := io.ReadAll(io.LimitReader(d, int64(maxDecoded)+1))
+		if e != nil || len(raw) > maxDecoded {
 			return nil, wire.ErrFrame
 		}
 		return raw, nil
@@ -325,17 +389,27 @@ func fields(raw []byte, fn func(protowire.Number, protowire.Type, []byte) error)
 	}
 	return nil
 }
-func parse(raw []byte) ([]series, error) {
+func parse(raw []byte, maxSamples int) ([]series, error) {
 	out := []series{}
 	count := 0
 	err := fields(raw, func(n protowire.Number, t protowire.Type, b []byte) error {
-		if n != 1 || t != protowire.BytesType || len(out) >= 1000 {
+		if n != 1 || t != protowire.BytesType {
+			// WriteRequest.metadata and any future top-level field are not part of this sink.
+			return nil
+		}
+		if len(out) >= maxSamples {
 			return wire.ErrFrame
 		}
 		s := series{labels: map[string]string{}}
 		e := fields(b, func(n protowire.Number, t protowire.Type, b []byte) error {
-			if t != protowire.BytesType {
-				return wire.ErrFrame
+			switch n {
+			case 1, 2:
+				if t != protowire.BytesType {
+					return wire.ErrFrame
+				}
+			default:
+				// exemplars (3), histograms (4) and future fields are skipped, not refused.
+				return nil
 			}
 			switch n {
 			case 1:
@@ -373,7 +447,7 @@ func parse(raw []byte) ([]series, error) {
 				}
 				s.labels[name] = value
 			case 2:
-				if count >= 1000 {
+				if count >= maxSamples {
 					return wire.ErrFrame
 				}
 				v := sample{}
@@ -403,7 +477,10 @@ func parse(raw []byte) ([]series, error) {
 					}
 					return nil
 				})
-				if e != nil || math.IsNaN(v.value) || math.IsInf(v.value, 0) {
+				// A stale NaN marker or an Inf value is data, not a framing error: the series that carries it is
+				// discarded in ServeHTTP. Refusing the whole block here would make vmagent drop every other
+				// series in the same request, which is the common case for a cluster with any stale target.
+				if e != nil {
 					return wire.ErrFrame
 				}
 				s.samples = append(s.samples, v)

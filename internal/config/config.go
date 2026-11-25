@@ -16,6 +16,7 @@ import (
 	"os"
 	"reflect"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -63,6 +64,10 @@ type Listener struct {
 	Key         string      `yaml:"key"`
 	WriterCA    string      `yaml:"writerCa"`
 	Principals  []Principal `yaml:"principals"`
+	// Remote-write request bounds. Zero selects the default. Captures ignores them.
+	MaxSamples      int   `yaml:"maxSamples"`
+	MaxBodyBytes    int64 `yaml:"maxBodyBytes"`
+	MaxDecodedBytes int64 `yaml:"maxDecodedBytes"`
 }
 type Config struct {
 	DeploymentLicensePath string `yaml:"deploymentLicensePath"`
@@ -84,6 +89,41 @@ type Config struct {
 		Proxy    string `yaml:"proxy"`
 	} `yaml:"uplink"`
 	Bindings []Binding `yaml:"bindings"`
+}
+
+// remoteWriteLimits applies the defaults and bounds of the remote-write request limits. A cluster with tens of
+// thousands of series needs a larger request than the defaults, and vmagent drops a block it cannot send, so the
+// bound is configurable rather than fixed.
+func remoteWriteLimits(c *Config) error {
+	l := &c.Modules.RemoteWrite
+	samples := int64(l.MaxSamples)
+	if samples < 0 {
+		return problem("modules.remoteWrite.maxSamples", "must not be negative")
+	}
+	if samples == 0 {
+		samples = 250000
+	}
+	if samples > 10000000 {
+		return problem("modules.remoteWrite.maxSamples", "must be at most 10000000")
+	}
+	l.MaxSamples = int(samples)
+	switch {
+	case l.MaxBodyBytes < 0:
+		return problem("modules.remoteWrite.maxBodyBytes", "must not be negative")
+	case l.MaxBodyBytes == 0:
+		l.MaxBodyBytes = 16 << 20
+	case l.MaxBodyBytes > 256<<20:
+		return problem("modules.remoteWrite.maxBodyBytes", "must be at most 268435456 (256 MiB)")
+	}
+	switch {
+	case l.MaxDecodedBytes < 0:
+		return problem("modules.remoteWrite.maxDecodedBytes", "must not be negative")
+	case l.MaxDecodedBytes == 0:
+		l.MaxDecodedBytes = 64 << 20
+	case l.MaxDecodedBytes > 512<<20:
+		return problem("modules.remoteWrite.maxDecodedBytes", "must be at most 536870912 (512 MiB)")
+	}
+	return nil
 }
 
 func Loopback(addr string) bool {
@@ -124,8 +164,30 @@ func Load(path string) (*Config, error) {
 	if v := strings.TrimSpace(os.Getenv("EDGE_VERBOSE")); v != "" {
 		c.Verbose = v == "1" || strings.EqualFold(v, "true")
 	}
+	for _, override := range []struct {
+		env   string
+		field string
+		set   func(int64)
+	}{
+		{"EDGE_REMOTEWRITE_MAX_SAMPLES", "modules.remoteWrite.maxSamples", func(n int64) { c.Modules.RemoteWrite.MaxSamples = int(n) }},
+		{"EDGE_REMOTEWRITE_MAX_BODY_BYTES", "modules.remoteWrite.maxBodyBytes", func(n int64) { c.Modules.RemoteWrite.MaxBodyBytes = n }},
+		{"EDGE_REMOTEWRITE_MAX_DECODED_BYTES", "modules.remoteWrite.maxDecodedBytes", func(n int64) { c.Modules.RemoteWrite.MaxDecodedBytes = n }},
+	} {
+		value := strings.TrimSpace(os.Getenv(override.env))
+		if value == "" {
+			continue
+		}
+		n, e := strconv.ParseInt(value, 10, 64)
+		if e != nil {
+			return nil, problem(override.field, override.env+" must be a whole number")
+		}
+		override.set(n)
+	}
 	if c.Uplink.Proxy == "" {
 		c.Uplink.Proxy = os.Getenv("HTTPS_PROXY")
+	}
+	if e := remoteWriteLimits(c); e != nil {
+		return nil, e
 	}
 	switch {
 	case c.StateDir == "":
@@ -427,6 +489,10 @@ func (s *Store) Reload(c *Config) error {
 	b.Bindings = nil
 	a.Modules.RemoteWrite.Principals = nil
 	b.Modules.RemoteWrite.Principals = nil
+	// Request limits are reloadable; everything else stays restart-only.
+	a.Modules.RemoteWrite.MaxSamples, b.Modules.RemoteWrite.MaxSamples = 0, 0
+	a.Modules.RemoteWrite.MaxBodyBytes, b.Modules.RemoteWrite.MaxBodyBytes = 0, 0
+	a.Modules.RemoteWrite.MaxDecodedBytes, b.Modules.RemoteWrite.MaxDecodedBytes = 0, 0
 	a.Modules.Captures.Principals = nil
 	b.Modules.Captures.Principals = nil
 	if !reflect.DeepEqual(a, b) {
