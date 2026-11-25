@@ -8,6 +8,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"github.com/1a11/clearintervals-edge/internal/wire"
@@ -178,6 +179,12 @@ func Dial(ctx context.Context, base, proxy string, cfg *tls.Config, forceTCP boo
 }
 func noRedirect(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 func (c *Connection) Unary(ctx context.Context, path string, v *pb.Lifecycle) (*pb.Frame, error) {
+	return c.unary(ctx, path, v, wire.MaxControl)
+}
+
+// unary is Unary with an explicit decoded-length limit, for answers that are
+// larger than an ordinary control frame.
+func (c *Connection) unary(ctx context.Context, path string, v *pb.Lifecycle, limit int) (*pb.Frame, error) {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	var raw bytes.Buffer
@@ -197,7 +204,7 @@ func (c *Connection) Unary(ctx context.Context, path string, v *pb.Lifecycle) (*
 	if res.StatusCode != 200 {
 		return nil, stage(fmt.Sprintf("http_status_%d", res.StatusCode))
 	}
-	f, _, e := wire.Read(res.Body, wire.MaxControl, nil)
+	f, _, e := wire.Read(res.Body, limit, nil)
 	if e != nil {
 		return nil, stage("invalid_response_frame")
 	}
@@ -213,6 +220,45 @@ func checked(f *pb.Frame) (*pb.Frame, error) {
 		return nil, &Failure{Code: v.Code, Retry: time.Duration(min(v.RetryAfterSeconds, 900)) * time.Second, Reason: v.Reason, Ref: v.Ref}
 	}
 	return f, nil
+}
+
+// Descriptor is one stream the cloud resolved from the promql the operator
+// configured. It reaches the gateway only in the answer to a request the
+// gateway itself sent; no local writer ever receives it.
+type Descriptor struct {
+	ID        string            `json:"id"`
+	StreamKey string            `json:"streamKey"`
+	SourceID  string            `json:"sourceId"`
+	Kind      string            `json:"kind"`
+	Selector  map[string]string `json:"selector"`
+	Scale     float64           `json:"scale"`
+	Metric    string            `json:"metric"`
+}
+
+// descriptorsLimit bounds the descriptor answer: 100 descriptors of a few
+// hundred JSON bytes each exceed an ordinary control frame, while the wire
+// still caps the frame itself at MaxFrame.
+const descriptorsLimit = 256 << 10
+
+// Descriptors asks the cloud for the stream descriptors behind the configured
+// promql. The request is outbound only: the gateway is the only party that
+// talks, and the answer is applied locally and never answered upstream.
+func (c *Connection) Descriptors(ctx context.Context, gid string, generation uint64) ([]Descriptor, error) {
+	f, e := c.unary(ctx, "descriptors", &pb.Lifecycle{GatewayId: gid, OperationId: id(), Generation: generation, Purpose: "descriptors"}, descriptorsLimit)
+	if e != nil {
+		return nil, e
+	}
+	payload := f.GetChallenge().GetSigningPayload()
+	if len(payload) == 0 {
+		return nil, nil
+	}
+	var body struct {
+		Items []Descriptor `json:"items"`
+	}
+	if e = json.Unmarshal(payload, &body); e != nil {
+		return nil, stage("invalid_descriptors")
+	}
+	return body.Items, nil
 }
 
 type Channel struct {

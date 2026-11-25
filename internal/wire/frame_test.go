@@ -69,6 +69,27 @@ func TestForgedItemCountIsRejectedBeforeProtobufExpansion(t *testing.T) {
 		t.Fatal("repeated-item expansion accepted")
 	}
 }
+
+// Descriptor answers travel in the challenge signing payload as up to 100
+// JSON-encoded streams, which no longer fit the 4 KiB proof payload.
+func TestDescriptorSigningPayloadFitsThePreflight(t *testing.T) {
+	payload := bytes.Repeat([]byte("x"), 60<<10)
+	var b bytes.Buffer
+	if e := Write(&b, &pb.Frame{Body: &pb.Frame_Challenge{Challenge: &pb.Challenge{SigningPayload: payload}}}); e != nil {
+		t.Fatal(e)
+	}
+	if _, _, e := Read(&b, MaxFrame, nil); e != nil {
+		t.Fatalf("descriptor payload rejected: %v", e)
+	}
+	b.Reset()
+	if e := Write(&b, &pb.Frame{Body: &pb.Frame_Challenge{Challenge: &pb.Challenge{SigningPayload: bytes.Repeat([]byte("x"), 65537)}}}); e != nil {
+		t.Fatal(e)
+	}
+	if _, _, e := Read(&b, MaxFrame, nil); e != ErrFrame {
+		t.Fatalf("oversized signing payload accepted: %v", e)
+	}
+}
+
 func TestFramingAndBombs(t *testing.T) {
 	f := &pb.Frame{Version: 1, Body: &pb.Frame_Hello{Hello: &pb.Hello{Version: "test", Protocols: []uint32{1}}}}
 	var b bytes.Buffer

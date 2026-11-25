@@ -291,17 +291,128 @@ type Store struct {
 	current atomic.Pointer[Config]
 	mu      sync.RWMutex
 	history map[string]Binding
+	// static holds the configuration-file bindings; the local file stays
+	// authoritative over cloud descriptors.
+	static []Binding
+	// dynamic is the most recent cloud descriptor set. It survives reloads, so
+	// rotating a principal in config.yaml does not erase the stream setup.
+	dynamic []Binding
+	synced  atomic.Bool
 }
 
 func New(c *Config) *Store {
-	s := &Store{history: map[string]Binding{}}
+	s := &Store{history: map[string]Binding{}, static: c.Bindings}
 	for _, b := range c.Bindings {
 		s.history[b.ID] = b
+	}
+	if len(c.Bindings) > 0 {
+		s.synced.Store(true)
 	}
 	s.current.Store(c)
 	return s
 }
 func (s *Store) Get() *Config { return s.current.Load() }
+
+// DescriptorsSynced reports whether stream bindings are known: either from the
+// configuration file at startup or from a completed cloud descriptor sync.
+// Remote write answers 503 while it is false, so a first batch is not dropped
+// as unmapped before the cloud has named the streams.
+func (s *Store) DescriptorsSynced() bool { return s.synced.Load() }
+
+// SyncDescriptors installs the stream descriptors fetched from the cloud. It is
+// safe to call while writers read the store. Configuration-file bindings win on
+// an ID or stream-key collision; a series descriptor that names no principals
+// gets every configured remote-write principal, and a series descriptor without
+// a scale gets 1, so the operator never repeats that per stream.
+func (s *Store) SyncDescriptors(descriptors []Binding) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// A sync that yields no descriptors still completes the wait: the cloud
+	// has answered and there is no series to accept, so remote write must stop
+	// holding the batch.
+	s.synced.Store(true)
+	current := s.Get()
+	principals := make([]string, 0, len(current.Modules.RemoteWrite.Principals))
+	for _, p := range current.Modules.RemoteWrite.Principals {
+		principals = append(principals, p.ID)
+	}
+	clean := make([]Binding, 0, len(descriptors))
+	ids := map[string]bool{}
+	keys := map[string]bool{}
+	for _, b := range descriptors {
+		b = normalizeDescriptor(b, principals)
+		if !descriptorValid(b) || ids[b.ID] || keys[b.StreamKey] {
+			continue
+		}
+		ids[b.ID] = true
+		keys[b.StreamKey] = true
+		clean = append(clean, b)
+	}
+	s.dynamic = clean
+	merged := mergeBindings(s.static, clean)
+	if reflect.DeepEqual(current.Bindings, merged) {
+		return false
+	}
+	next := *current
+	next.Bindings = merged
+	s.current.Store(&next)
+	return true
+}
+
+// normalizeDescriptor fills the fields the cloud leaves to the gateway.
+func normalizeDescriptor(b Binding, principals []string) Binding {
+	if b.Kind == "series" && len(b.Principals) == 0 {
+		b.Principals = append([]string(nil), principals...)
+	}
+	if b.Kind == "series" && b.Scale == 0 {
+		b.Scale = 1
+	}
+	return b
+}
+
+// descriptorValid keeps a malformed or unexpected descriptor out of the active
+// configuration; the same rules the configuration file is held to apply.
+func descriptorValid(b Binding) bool {
+	if !wire.ValidID(b.ID) || !wire.ValidID(b.SourceID) || len(b.StreamKey) < 40 || len(b.StreamKey) > 100 {
+		return false
+	}
+	switch b.Kind {
+	case "series":
+		return len(b.Selector) > 0 && len(b.Selector) <= 64 && !math.IsNaN(b.Scale) && !math.IsInf(b.Scale, 0)
+	case "captures":
+		return len(b.Selector) == 0 && b.Scale == 0
+	}
+	return false
+}
+
+// mergeBindings layers cloud descriptors below the configuration-file bindings.
+// It returns source unchanged when no descriptor adds a binding.
+func mergeBindings(source, dynamic []Binding) []Binding {
+	if len(dynamic) == 0 {
+		return source
+	}
+	merged := make([]Binding, 0, len(source)+len(dynamic))
+	ids := map[string]bool{}
+	keys := map[string]bool{}
+	for _, b := range source {
+		merged = append(merged, b)
+		ids[b.ID] = true
+		keys[b.StreamKey] = true
+	}
+	for _, b := range dynamic {
+		if ids[b.ID] || keys[b.StreamKey] {
+			continue
+		}
+		merged = append(merged, b)
+		ids[b.ID] = true
+		keys[b.StreamKey] = true
+	}
+	if len(merged) == len(source) {
+		return source
+	}
+	return merged
+}
+
 func (s *Store) Reload(c *Config) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -323,7 +434,18 @@ func (s *Store) Reload(c *Config) error {
 			}
 		}
 	}
-	s.current.Store(c)
+	s.static = c.Bindings
+	if len(c.Bindings) > 0 {
+		s.synced.Store(true)
+	}
+	merged := mergeBindings(c.Bindings, s.dynamic)
+	next := c
+	if len(merged) != len(c.Bindings) {
+		copied := *c
+		copied.Bindings = merged
+		next = &copied
+	}
+	s.current.Store(next)
 	for _, b := range c.Bindings {
 		s.history[b.ID] = b
 	}

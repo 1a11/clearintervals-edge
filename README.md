@@ -15,7 +15,7 @@ The edge gateway runs on your local network and forwards machine telemetry to Cl
 ```
 
 - **Outbound only:** Connects over HTTP/3 (UDP 443), falling back to HTTP/2 (TCP 443) or an HTTP CONNECT proxy. Opens no external ports and accepts no inbound commands.
-- **Explicit allowlisting:** Drops and counts any series or channel that does not match a configured binding.
+- **Explicit allowlisting:** Drops and counts any series or channel that does not match a configured binding. Until the first descriptor sync completes, an unmatched series receives `503` with `Retry-After: 15` so the writer keeps its first batch.
 - **Disk-backed durability:** Returns success to writers only after `fsync` completes. Buffers data during outages (default: 10 GiB or 7 days).
 - **Managed identity:** Generates its private key locally and enrolls once with a single-use license. Certificates expire after 24 hours and renew automatically. Private keys remain inside the state volume.
 
@@ -41,7 +41,7 @@ sudo chown -R 65532:65532 /srv/edgegateway/state
 sudo chmod 700 /srv/edgegateway/state && sudo chmod 600 /srv/edgegateway/state/enrollment/license.json
 ```
 
-The gateway deletes `license.json` after enrollment succeeds. If the license includes a `streamBindings` roster, startup fails when a configured binding is missing and warns when a stream key does not match.
+The gateway deletes `license.json` after enrollment succeeds. If the license includes a non-empty `streamBindings` roster, startup fails when a configured binding is missing and warns when a stream key does not match. A freshly downloaded configuration has no bindings and an empty roster: after enrollment the gateway fetches the stream descriptors behind the configured PromQL from the cloud and installs them itself, refreshing them every 15 seconds while connected (see `descriptors_synced`).
 
 ### 2. Create a writer token
 
@@ -173,6 +173,7 @@ The gateway writes JSON lines to `stdout`. Every log line includes `event`; erro
 | `ntp_drift`, `clock_skew` | Clock differs from cloud (warns above 2 s, errors above 30 s). Enable NTP. |
 | `stream_keys_rejected` | Cloud does not recognize a configured stream key. Copy the current binding from Clear Intervals. |
 | `stream_key_digest_mismatch` | Configured stream key does not match the license roster. Update the rotated or mistyped key. |
+| `descriptors_synced`, `descriptors_unavailable`, `descriptors_cache_failed` | Stream descriptors were applied from the cloud (`cloud`) or the startup cache; a failed fetch holds remote write at `503` with `Retry-After: 15`; the cache could not be written but the descriptors are active. |
 | `records_dropped`, `dropReason` `unmapped` | Incoming series match no binding selector. Check `bindings[].selector` labels. |
 | Writer receives `401` or `403` | Invalid token, or the writer principal is not listed on the matched binding. |
 | `buffer_integrity_alarm` | Disk error or corrupt segment. Inspect the disk; corrupt segments move to `.bad`. |

@@ -18,8 +18,8 @@ Region is configuration, never a caller-selected routing destination.
 An absent client certificate is permitted only on `/challenge`, `/enroll`,
 `/recover` and `/operations/result` below `/uplink/v1`. A presented certificate
 must be currently valid even on those endpoints. Recovery supplies its expired
-certificate in the message body. Renew, control and data require the actual TLS
-identity; headers and payload gateway IDs never substitute for it.
+certificate in the message body. Renew, control, descriptors and data require the
+actual TLS identity; headers and payload gateway IDs never substitute for it.
 
 Before accepting a client identity at the handshake, cloud calls core `/admit`
 with a two-second deadline and no positive fallback. Control calls admit again
@@ -104,8 +104,38 @@ frontier advances only through contiguous fully terminal batches; after a gap it
 stays conservative for the remainder of that stream. Explicit item outcomes are
 authoritative; sequence alone never authorizes edge buffer deletion.
 
-The cloud sends no application frame before an edge frame and never sends
-bindings, source configuration, commands, raw data or unsolicited credit.
+The cloud sends no application frame before an edge frame. It never pushes
+bindings, source configuration, commands, raw data or unsolicited credit: the
+stream descriptors in the next section are returned only as the reply to the
+gateway's own `/uplink/v1/descriptors` request.
+
+## Stream descriptors
+
+A gateway enrolled from the product's download configuration starts with no
+bindings. It learns the streams behind the configured PromQL by asking, and the
+cloud answers only that request: `POST /uplink/v1/descriptors` carries one
+`Lifecycle{gatewayId, operationId, generation, purpose: "descriptors"}` frame.
+The body only proposes the gateway and generation; the certificate is the
+identity, and a body naming another gateway or generation is refused.
+
+The reply is a `Challenge` frame with `challenge: "descriptors-v1"`, `expiresAt`
+set to core's confirmation time, and `signingPayload` holding a JSON object of at
+most 65536 bytes:
+
+```json
+{"items": [{"id": "binding-…", "streamKey": "…", "sourceId": "dev-…",
+            "kind": "series", "metric": "Temperature, °C",
+            "selector": {"__name__": "vm_motor_temperature_celsius", "site": "north"},
+            "scale": 1}]}
+```
+
+Each item describes one active binding: its immutable binding version, the
+gateway-specific stream key, the canonical source, the kind, the reading name,
+the exact-label selector it matches and the unit scale. Core decides what the
+gateway may receive; the cloud never invents a descriptor. Requests are limited
+to 30 per minute per gateway and refusals use the `session` lane. A gateway asks
+once per connection and every 15 seconds while its session is open, so a stream
+added in the product starts flowing without a restart.
 
 ## Record content and canonical hashes
 

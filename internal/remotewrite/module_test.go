@@ -193,3 +193,32 @@ func TestBasicAuthAndBoundedPasswordWorkers(t *testing.T) {
 	}
 
 }
+
+// Before the cloud has named the streams, an unmapped sample must be held, not
+// dropped: vmagent retries the 503 from its WAL once the descriptors arrive.
+func TestUnmappedSamplesWaitForTheDescriptorSync(t *testing.T) {
+	c := new(config.Config)
+	c.Buffer.MaxAgeDays = 7
+	digest := sha256.Sum256([]byte(testToken))
+	c.Modules.RemoteWrite.Principals = []config.Principal{{ID: "writer", TokenSHA256: hex.EncodeToString(digest[:])}}
+	q, e := buffer.Open(t.TempDir(), 1<<20, 7*24*time.Hour, 100)
+	if e != nil {
+		t.Fatal(e)
+	}
+	m := New(config.New(c), q)
+	raw := snappy.Encode(nil, request(1, time.Now().UnixMilli()))
+	w := submit(m, raw, testToken, "snappy")
+	if w.Code != 503 || w.Header().Get("Retry-After") != "15" {
+		t.Fatalf("first batch not held: %d %q", w.Code, w.Header().Get("Retry-After"))
+	}
+	if s, _, _ := q.Snapshot(); s.Drops["unmapped"] != 0 {
+		t.Fatal("held batch counted as dropped", s)
+	}
+	m.Config.SyncDescriptors(nil)
+	if w := submit(m, raw, testToken, "snappy"); w.Code != 204 {
+		t.Fatalf("sync completed but write still held: %d", w.Code)
+	}
+	if s, _, _ := q.Snapshot(); s.Drops["unmapped"] != 1 {
+		t.Fatal("unmapped sample not accounted after the sync", s)
+	}
+}

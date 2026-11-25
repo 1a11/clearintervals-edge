@@ -65,6 +65,65 @@ func TestLicenceRosterAuthorizesConfiguredBindings(t *testing.T) {
 	}
 }
 
+// An empty roster is the shape of a freshly downloaded configuration: the
+// gateway enrolls with no bindings and receives its stream descriptors from the
+// cloud afterwards, so the check must not fail and must not invent bindings.
+func TestEmptyRosterSkipsCheck(t *testing.T) {
+	p := testkit.New(t)
+	dir := t.TempDir()
+	key := strings.Repeat("k", 43)
+	// rosterLicence uses omitempty, so an empty roster would be dropped from
+	// the JSON; patch the marshalled licence to carry an explicit empty array.
+	path := rosterLicence(t, dir, p, []StreamBinding{{ID: "b1", Kind: "series", DeviceID: "d1", KeyDigest: digest(key)}})
+	raw, e := os.ReadFile(path)
+	if e != nil {
+		t.Fatal(e)
+	}
+	var l map[string]any
+	if e = json.Unmarshal(raw, &l); e != nil {
+		t.Fatal(e)
+	}
+	l["streamBindings"] = []any{}
+	if raw, e = json.Marshal(l); e != nil {
+		t.Fatal(e)
+	}
+	if e = os.WriteFile(path, raw, 0600); e != nil {
+		t.Fatal(e)
+	}
+	m, e := Open(filepath.Join(dir, "identity"), path)
+	if e != nil {
+		t.Fatal(e)
+	}
+	if m.Trust.StreamBindings == nil {
+		t.Fatal("explicit empty roster decoded as nil")
+	}
+	if _, e = m.CheckBindings([]Binding{{ID: "b1", Kind: "series", SourceID: "s1", StreamKey: key}}); e != nil {
+		t.Fatalf("binding rejected against an empty roster: %v", e)
+	}
+	// A static roster still authorizes nothing outside itself.
+	m.Trust.StreamBindings = []StreamBinding{{ID: "b1", Kind: "series", DeviceID: "d1", KeyDigest: digest(key)}}
+	if _, e = m.CheckBindings([]Binding{{ID: "b2", Kind: "series", SourceID: "s2", StreamKey: key}}); e == nil {
+		t.Fatal("binding outside a non-empty roster accepted")
+	}
+}
+
+func TestMissingRosterSkipsCheck(t *testing.T) {
+	p := testkit.New(t)
+	dir := t.TempDir()
+	key := strings.Repeat("k", 43)
+	path := rosterLicence(t, dir, p, nil)
+	m, e := Open(filepath.Join(dir, "identity"), path)
+	if e != nil {
+		t.Fatal(e)
+	}
+	if m.Trust.StreamBindings != nil {
+		t.Fatal("roster-less licence decoded with a non-nil roster")
+	}
+	if _, e = m.CheckBindings([]Binding{{ID: "b1", Kind: "series", SourceID: "s1", StreamKey: key}}); e != nil {
+		t.Fatalf("binding rejected without a roster: %v", e)
+	}
+}
+
 func TestRotatedLicenceRefreshesRoster(t *testing.T) {
 	p := testkit.New(t)
 	dir := t.TempDir()

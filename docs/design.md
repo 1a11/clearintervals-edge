@@ -122,7 +122,7 @@ The licence file is a **one-time enrollment bundle**, created in the product by 
 | `trustAnchors` | The Clear Intervals ingest root CA certificate(s). The edge gateway trusts only these for the cloud, never the system store. |
 | `enrollmentToken` | 256 random bits, single use. Core stores only its hash. |
 | `expiresAt` | When the token stops working (default 7 days after issue). |
-| `streamBindings` | Optional roster of authorized bindings: `id`, `kind`, `deviceId`, `sensorId`, `assetId` and `keyDigest` (hex SHA-256 of the stream key). When present, a configured binding outside the roster is fatal and a digest mismatch is a loud warning; a rotated licence refreshes the roster. Older licences omit it. |
+| `streamBindings` | Optional roster of authorized bindings: `id`, `kind`, `deviceId`, `sensorId`, `assetId` and `keyDigest` (hex SHA-256 of the stream key). When present and non-empty, a configured binding outside the roster is fatal and a digest mismatch is a loud warning; a rotated licence refreshes the roster. Older licences omit it. A download configuration starts with no bindings and an empty roster: after enrollment the gateway requests the stream descriptors for its promql from the cloud and installs them itself. |
 
 It is not "Application Default Credentials": that is Google Cloud's way of finding credentials and has nothing to
 do with this system. From the NHI Management Group's guidance on non-human identities we take the principles: one

@@ -51,7 +51,9 @@ func NewWithAuth(c *config.Store, q *buffer.Queue, gate *httpauth.Gate) *Module 
 }
 func fail(w http.ResponseWriter, status int) {
 	if status == 429 || status == 503 {
-		w.Header().Set("Retry-After", "5")
+		if w.Header().Get("Retry-After") == "" {
+			w.Header().Set("Retry-After", "5")
+		}
 	}
 	http.Error(w, http.StatusText(status), status)
 }
@@ -131,6 +133,14 @@ func (m *Module) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if len(matches) == 0 {
+			if !m.Config.DescriptorsSynced() {
+				// The cloud has not named the streams yet. Answering 503 keeps
+				// the first batch in vmagent's WAL; dropping it as unmapped
+				// before the initial descriptor sync would lose those samples.
+				w.Header().Set("Retry-After", "15")
+				fail(w, http.StatusServiceUnavailable)
+				return
+			}
 			unmapped += uint64(len(s.samples))
 			continue
 		}
